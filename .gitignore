@@ -8,7 +8,6 @@ node_modules/
 *.mjs
 x402_wallet_project.json
 .openrouter_key*
-.github/
 RESUME_REVIEW.bat
 focused_review*.py
 dual_review_acct2.py
