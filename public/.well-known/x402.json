@@ -1,8 +1,8 @@
 {
   "service_id": "csv-to-parquet-stream-compressor",
   "display_name": "CSV-to-Parquet Stream Compressor",
-  "tagline": "Buffered ~100 MB multipart uploads converted",
-  "description": "Serverless conversion service that Converts delimited-text uploadscsv/.tsv/.txt files (multipart upload) into ZSTD-compressed Apache Parquet using PyArrow on RunPod serverless CPU. Inputs under 10 GB land automatically in provider R2 temp storage with a 24-hour lifecycle and a presigned download link. inputs at or above 10 GiB (10737418240 bytes) require a caller-supplied S3-compatible target destination. Pay-per-use settlement via x402 v2 USDC on Base.",
+  "tagline": "Converts CSV into ZSTD-compressed Apache Parquet",
+  "description": "Convert .csv, .tsv, and .txt files into compressed Apache Parquet. Uploads up to ~100 MB accepted per request; files 10 GB or larger can be delivered directly to your own S3-compatible storage. Pay-per-use via x402 v2 USDC on Base.",
   "categories": [
     "Data Engineering",
     "Developer Tools",
@@ -51,7 +51,8 @@
         "cost_usd_flat": 0.01,
         "storage_target": "internal_r2",
         "retention": "24_hours",
-        "retention_note": "enforced via deployed r2-lifecycle.json rule"
+        "retention_note": "enforced via deployed r2-lifecycle.json rule",
+        "range_human": "0 \u2013 0.0976562 GB"
       },
       {
         "tier": 2,
@@ -63,7 +64,8 @@
         "storage_target": "internal_r2",
         "retention": "24_hours",
         "storage_note": "a file of exactly 10737418240 bytes requires BYO destination per the >=10 GiB rule",
-        "retention_note": "enforced via deployed r2-lifecycle.json rule"
+        "retention_note": "enforced via deployed r2-lifecycle.json rule",
+        "range_human": "0.0976562 GB \u2013 10 GB"
       },
       {
         "tier": 3,
@@ -73,7 +75,8 @@
         "rate_type": "per_gb",
         "rate_usd_per_gb": 0.05,
         "storage_target": "user_supplied_destination",
-        "retention": "permanent_on_user_storage"
+        "retention": "permanent_on_user_storage",
+        "range_human": "10 GB \u2013 100 GB"
       },
       {
         "tier": 4,
@@ -83,7 +86,8 @@
         "rate_type": "per_gb",
         "rate_usd_per_gb": 0.015,
         "storage_target": "user_supplied_destination",
-        "retention": "permanent_on_user_storage"
+        "retention": "permanent_on_user_storage",
+        "range_human": "100 GB \u2013 1024 GB"
       },
       {
         "tier": 5,
@@ -94,7 +98,8 @@
         "rate_usd_per_gb": 0.008,
         "storage_target": "user_supplied_destination",
         "retention": "permanent_on_user_storage",
-        "range_max_bytes": null
+        "range_max_bytes": null,
+        "range_human": "above 1024 GB"
       }
     ]
   },

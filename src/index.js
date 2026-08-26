@@ -207,7 +207,17 @@ export default {
         try {
           const epHost = new URL(dest.endpoint_url).hostname;
           const blocked = /^(169\.254\.|10\.|127\.|0\.0\.0\.0$|100\.(6[4-9]|[7-9]\d|1[01]\d)\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|198\.(1[89])\.|\[::1\]|\[f[eE]80:)/;
-          if (blocked.test(epHost) || epHost === 'localhost' ||
+          // OX-ALPHA SSRF extension: URL parsers normalize alternative IP
+          // encodings before dialing, so dotted-quad checks alone are not
+          // enough to keep BYO targets off private infrastructure:
+          //   - all-numeric host    -> decimal integer IP ('2130706433' == 127.0.0.1)
+          //   - 0x-prefixed hex     -> hex-encoded IP ('0x7f000001')
+          //   - [fc..: / [fd..:    -> IPv6 unique-local (fc00::/7)
+          const numericIpHost = /^\d+$/.test(epHost);
+          const hexIpHost = /^0[xX][0-9a-fA-F]+$/.test(epHost);
+          const ipv6UlaHost = /^\[[fF][cCdD]/.test(epHost);
+          if (blocked.test(epHost) || numericIpHost || hexIpHost || ipv6UlaHost ||
+              epHost === 'localhost' ||
               epHost === 'metadata.google.internal' || epHost.endsWith('.internal') ||
               epHost.endsWith('.local'))
             return json({ error: 'forbidden_destination_host' }, 400);
@@ -283,7 +293,24 @@ export default {
       //     not strand a reservation (review R12).
       {
         const pb = await spendguard.preflightRunpodBalance(env);
-        if (!pb.ok) return json({ error: 'upstream_balance_unavailable', note: pb.note }, pb.status);
+        if (!pb.ok) {
+          // OX-ALPHA (FIX-1): no reservation was made and no job will run, so
+          // release the nonce claim taken in verifyPayment exactly like every
+          // other post-payment failure path — the client keeps its payment
+          // retryable with the SAME signature once upstream balance recovers.
+          if (env.CONSUMED_TX_STORE && v && v.nonce) {
+            ctx.waitUntil((async () => {
+              try {
+                const id = env.CONSUMED_TX_STORE.idFromName('singleton');
+                const stub = env.CONSUMED_TX_STORE.get(id);
+                await stub.fetch('https://internal/release-nonce', {
+                  method: 'POST', headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ nonce: v.nonce }) });
+              } catch (_) {}
+            })());
+          }
+          return json({ error: 'upstream_balance_unavailable', note: pb.note }, pb.status);
+        }
       }
 
       // (8.5) ATOMIC BUDGET RESERVATION (SpendGuard DO) — payment already
@@ -353,7 +380,8 @@ export default {
               // RunPod accepted (upstream_unreachable) guarantees no compute was
               // bought — RELEASE the reservation by reconciling actual cost as $0.
               // (reconcile stays on THIS path ONLY.)
-              ctx.waitUntil(reconcileDailyBudget(env, budgetTxId, 0).catch(() => {}));
+              // OX-ALPHA (FIX-3): unified ':reconcile' key on ALL reconciles.
+              ctx.waitUntil(reconcileDailyBudget(env, budgetTxId + ':reconcile', 0).catch(() => {}));
         // R25: release the pre-dispatch nonce claim — no compute was bought/delivered.
         if (env.CONSUMED_TX_STORE && v && v.nonce) {
           ctx.waitUntil((async () => {
@@ -372,8 +400,11 @@ export default {
       if (request.signal) request.signal.removeEventListener('abort', onAbort);
 
       if (!upstream.ok) {
-        // R24: upstream failed before conversion output — reconcile $0.
-        ctx.waitUntil(reconcileDailyBudget(env, budgetTxId, est).catch(() => {}));
+        // R24 + OX-ALPHA (FIX-2): a non-2xx from RunPod means no conversion
+        // output was delivered — reconcile the reservation to $0 (the previous
+        // code passed `est`, leaving the full estimate standing against the
+        // daily ledger). OX-ALPHA (FIX-3): unified ':reconcile' key.
+        ctx.waitUntil(reconcileDailyBudget(env, budgetTxId + ':reconcile', 0).catch(() => {}));
         // R25: release the pre-dispatch nonce claim — no compute was bought/delivered.
         if (env.CONSUMED_TX_STORE && v && v.nonce) {
           ctx.waitUntil((async () => {
@@ -399,7 +430,8 @@ export default {
         // conversion output was delivered, so treat it like the other
         // pre-output failures (upstream_unreachable / upstream_error):
         // reconcile the reservation to $0 — no compute was bought.
-        ctx.waitUntil(reconcileDailyBudget(env, budgetTxId, 0).catch(() => {}));
+        // OX-ALPHA (FIX-3): unified ':reconcile' key on ALL reconciles.
+        ctx.waitUntil(reconcileDailyBudget(env, budgetTxId + ':reconcile', 0).catch(() => {}));
         // R25: release the pre-dispatch nonce claim — no compute was bought/delivered.
         if (env.CONSUMED_TX_STORE && v && v.nonce) {
           ctx.waitUntil((async () => {
@@ -454,7 +486,9 @@ export default {
         } catch (e) {
           // OX-ALPHA: KV burn failed -> reconcile to est (NOT $0) since the job
           // ran and billed compute; refusing delivery would waste it.
-          ctx.waitUntil(reconcileDailyBudget(env, budgetTxId, est).catch(() => {}));
+          // OX-ALPHA (FIX-3): unified ':reconcile' key here too (amount stays
+          // est — the job genuinely billed compute).
+          ctx.waitUntil(reconcileDailyBudget(env, budgetTxId + ':reconcile', est).catch(() => {}));
           return json({ error: 'nonce_consumption_failed' }, 503);
         }
       }

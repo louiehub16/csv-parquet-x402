@@ -3,7 +3,8 @@
 // ceilingCheck, deficitCheck, wireDisconnectGuard + estimateBuildCostUsd helper.
 // Config arrives ONLY via env.SG_* vars with hardcoded fallbacks (documented per check below):
 //   SG_MIN_BALANCE     default "2.00" — RunPod account balance floor for the preflight gate (USD).
-//   SG_MAX_JOB_COST    default "0.50" — per-request build-cost ceiling (USD).
+//   SG_MAX_JOB_COST    default "1.00" — per-request build-cost ceiling (USD); matches the max
+//                      internal-tier price for a single file (10 GiB @ $0.10/GB = $1.00).
 //   SG_CPU_RATE_PER_HR default "0.04" — CPU builder economics ($/hour); costs are CPU, NOT GPU.
 // REJECTED source-doc patterns are deliberately ABSENT here: no HMAC/timestamp gates, no IP bans,
 // no WAF/blocklist writes. wireDisconnectGuard only aborts the caller-supplied AbortController.
@@ -149,14 +150,18 @@ export async function preflightRunpodBalance(env) {
   }
 }
 
-// SAFETY: PER_REQUEST_COST_CEILING — estimated build cost above SG_MAX_JOB_COST (default "0.50")
+// SAFETY: PER_REQUEST_COST_CEILING — estimated build cost above SG_MAX_JOB_COST (default "1.00")
 // is rejected before provisioning. Returns {ok:true} | {ok:false,status:400}.
+// CEILING-TIER-ALIGN: the default matches the max internal-tier price for a single file
+// (10 GiB @ $0.10/GB = $1.00) so every priceable internal-tier job can clear its own ceiling;
+// the old 0.50 default let jobs between $0.50 and $1.00 receive a priced 402 challenge, then
+// rejected them here AFTER payment.
 export function ceilingCheck(costUsd, env) {
   // R13 FIX-A: guard a missing/non-object env (e.g. ceilingCheck(cost, undefined)) — without
   // this the SG_MAX_JOB_COST property read below THROWS instead of falling back to the
-  // documented 0.50 default. Fail-closed preserved: numEnv(undefined, 0.50) applies the cap.
+  // documented 1.00 default. Fail-closed preserved: numEnv(undefined, 1.00) applies the cap.
   if (!env || typeof env !== "object") env = {};
-  const cap = numEnv(env.SG_MAX_JOB_COST, 0.50);
+  const cap = numEnv(env.SG_MAX_JOB_COST, 1.00);
   const cost = Number(costUsd);
   // A cost we cannot even compute is unpriceable -> never provision it.
   // R12.1 F5: negative cost is malformed (would bypass the cap) -> reject, not pass.

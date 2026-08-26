@@ -28,7 +28,8 @@
     //   CDP_API_KEY_ID, CDP_API_SECRET (facilitator x402 verify/settle)
     // SpendGuard knobs (hardcoded fallbacks live in src/spendguard.js):
     "SG_MIN_BALANCE": "2.00",
-    "SG_MAX_JOB_COST": "0.50",
+    // Ceiling matches the max internal-tier price for a single file (10 GiB @ $0.10/GB = $1.00)
+    "SG_MAX_JOB_COST": "1.00",
     "SG_CPU_RATE_PER_HR": "0.13",
     // Merchant wallet (public address — safe as a var; never put private keys here)
     "MERCHANT_WALLET_ADDRESS": "0x795dCA28d0e8a0E5d19D689163f125a7da1D0B83"

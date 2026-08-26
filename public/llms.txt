@@ -7,8 +7,7 @@
 
 A serverless data-conversion endpoint for delimited-text files. Today's public
 endpoint accepts uploads up to ~100 MB per request (direct multi-GB streaming
-is roadmap); conversion runs through PyArrow on RunPod serverless CPU,
-emitting ZSTD-compressed Apache Parquet. Inputs under 10 GB
+is roadmap), emitting ZSTD-compressed Apache Parquet. Inputs under 10 GB
 land automatically in provider R2 temp storage (24-hour lifecycle) with a
 presigned download link returned in the response; inputs at or above 10 GB
 require the caller to supply an S3-compatible `target_destination` where the
@@ -52,11 +51,11 @@ Base via x402 v2 (exact scheme).
 
 | # | Input size range (bytes)                | Rate         | Cost example        | Storage target              | Retention                  |
 |---|-----------------------------------------|--------------|---------------------|------------------------------|----------------------------|
-| 1 | 0 – 104857599 (under 104857600 bytes)              | flat $0.01   | $0.01               | internal_r2                  | 24_hours                   |
-| 2 | 104857600 – 10737418240 (inclusive)     | $0.10 per GB | 5 GB → $0.50        | internal_r2                  | 24_hours                   |
-| 3 | 10737418241 – 107374182400 (inclusive) | $0.05 per GB | 50 GB → $2.50       | user_supplied_destination    | permanent_on_user_storage  |
-| 4 | 107374182401 – 1099511627776 (inclusive) | $0.015 per GB| 500 GB → $7.50      | user_supplied_destination    | permanent_on_user_storage  |
-| 5 | above 1099511627776 (above 1 TB, > 1 TB)  | $0.008 per GB| 5 TB → $40.00       | user_supplied_destination    | permanent_on_user_storage  |
+| 1 | under 100 MB                              | flat $0.01   | $0.01               | internal_r2                  | 24_hours                   |
+| 2 | 100 MB – 10 GB                           | $0.10 per GB | 5 GB → $0.50        | internal_r2                  | 24_hours                   |
+| 3 | 10 GB – 100 GB                           | $0.05 per GB | 50 GB → $2.50       | user_supplied_destination    | permanent_on_user_storage  |
+| 4 | 100 GB – 1 TB                            | $0.015 per GB| 500 GB → $7.50      | user_supplied_destination    | permanent_on_user_storage  |
+| 5 | above 1 TB                                | $0.008 per GB| 5 TB → $40.00       | user_supplied_destination    | permanent_on_user_storage  |
 
 Note: the exact micro-USDC amount is computed per-request from byte size and
 returned in the live 402 PAYMENT-REQUIRED manifest — authoritative over these

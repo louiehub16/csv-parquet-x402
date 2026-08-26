@@ -5,7 +5,7 @@
   "tools": [
     {
       "name": "compress_csv_stream",
-      "description": "Accept a .csv/.tsv/.txt file (buffered multipart upload, ~100 MB practical today) and convert it to ZSTD-compressed Apache Parquet via PyArrow. Inputs < 10 GB are stored in provider R2 temp storage with a presigned download link valid for 24 hours; inputs >= 10 GiB require an S3-compatible target_destination supplied by the caller. First call without payment returns HTTP 402 with a PAYMENT-REQUIRED manifest (x402 v2, exact USDC amount on Base); settle and retry with the PAYMENT-SIGNATURE header.",
+      "description": "Accept a .csv/.tsv/.txt file and receive a compressed Apache Parquet file. Files under 10 GB return a download link valid for 24 hours. valid for 24 hours; inputs >= 10 GiB require an S3-compatible target_destination supplied by the caller. First call without payment returns HTTP 402 with a PAYMENT-REQUIRED manifest (x402 v2, exact USDC amount on Base); settle and retry with the PAYMENT-SIGNATURE header.",
       "inputSchema": {
         "type": "object",
         "properties": {

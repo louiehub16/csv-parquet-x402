@@ -3,7 +3,7 @@
   "info": {
     "title": "CSV-to-Parquet Stream Compressor",
     "version": "1.0.0",
-    "description": "Converts delimited-text uploadscsv/.tsv/.txt multipart uploads into ZSTD-compressed Apache Parquet via PyArrow on RunPod serverless CPU. Settled with x402 v2 USDC on Base.",
+    "description": "Converts .csv/.tsv/.txt uploads into ZSTD-compressed Apache Parquet. Settled with x402 v2 USDC on Base.",
     "contact": {
       "email": "support@YOURDOMAIN.placeholder"
     }
@@ -116,7 +116,7 @@
       "post": {
         "operationId": "compressCsvStream",
         "summary": "Convert a CSV/TSV/TXT file to ZSTD-compressed Parquet",
-        "description": "First unauthenticated call returns 402 with a PAYMENT-REQUIRED header manifest containing the exact micro-USDC amount for the request. Pay in USDC on Base per that manifest, then retry the identical request adding a PAYMENT-SIGNATURE header with the payment proof. Pricing tiers (upper bounds inclusive \u2014 a file of exactly an upper bound prices in that tier): under 104857600 bytes flat $0.01; up to 10737418240 bytes $0.10/GB; up to 107374182400 bytes $0.05/GB (BYO storage required >=10GB); up to 1099511627776 bytes $0.015/GB (BYO); above 1099511627776 bytes $0.008/GB (BYO). Minimum charge $0.01. The 402 manifest carries the exact micro-USDC amount.",
+        "description": "First unauthenticated call returns 402 with a PAYMENT-REQUIRED header manifest containing the exact micro-USDC amount for the request. Pay in USDC on Base per that manifest, then retry the identical request adding a PAYMENT-SIGNATURE header with the payment proof. Pricing tiers (upper bounds inclusive \u2014 a file of exactly an upper bound prices in that tier): under 100 MB flat $0.01; up to 10737418240 bytes $0.10/GB; up to 107374182400 bytes $0.05/GB (BYO storage required >=10GB); up to 1099511627776 bytes $0.015/GB (BYO); above 1099511627776 bytes $0.008/GB (BYO). Minimum charge $0.01. The 402 manifest carries the exact micro-USDC amount.",
         "requestBody": {
           "required": true,
           "content": {
