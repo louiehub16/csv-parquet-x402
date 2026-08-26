@@ -1,0 +1,26 @@
+{
+  "mcp": true,
+  "protocol_version": "2024-11-05",
+  "service_id": "csv-to-parquet-stream-compressor",
+  "tools": [
+    {
+      "name": "compress_csv_stream",
+      "description": "Accept a .csv/.tsv/.txt file (buffered multipart upload, ~100 MB practical today) and convert it to ZSTD-compressed Apache Parquet via PyArrow. Inputs < 10 GB are stored in provider R2 temp storage with a presigned download link valid for 24 hours; inputs >= 10 GiB require an S3-compatible target_destination supplied by the caller. First call without payment returns HTTP 402 with a PAYMENT-REQUIRED manifest (x402 v2, exact USDC amount on Base); settle and retry with the PAYMENT-SIGNATURE header.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "file": {
+            "type": "string",
+            "format": "binary",
+            "description": "The CSV/TSV/TXT payload to compress"
+          },
+          "target_destination": {
+            "type": "string",
+            "description": "Optional JSON string describing an S3-compatible destination; required for inputs >= 10 GiB"
+          }
+        },
+        "required": ["file"]
+      }
+    }
+  ]
+}

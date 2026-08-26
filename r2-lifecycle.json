@@ -1,0 +1,14 @@
+{
+  "Rules": [
+    {
+      "ID": "AutoDeleteOutputs24h",
+      "Status": "Enabled",
+      "Filter": {
+        "Prefix": "outputs/"
+      },
+      "Expiration": {
+        "Days": 1
+      }
+    }
+  ]
+}

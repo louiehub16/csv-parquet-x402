@@ -1,0 +1,37 @@
+{
+  // LABEL: csv-parquet-x402 gateway — Cloudflare Worker (x402 v2 seller)
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "csv-parquet-compressor",
+  "main": "src/index.js",
+  "compatibility_date": "2026-08-01",
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS"
+  },
+  "kv_namespaces": [
+    { "binding": "SECURITY_KV", "id": "REPLACE_WITH_KV_NAMESPACE_ID" }
+  ],
+  // SpendGuard's atomic budget ledger (budget.js) routes through this DO.
+  // The ConsumedTxStore class is exported from src/replay-store.js.
+  "durable_objects": {
+    "bindings": [
+      { "name": "CONSUMED_TX_STORE", "class_name": "ConsumedTxStore" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["ConsumedTxStore"] }
+  ],
+  "vars": {
+    // Public config only — secrets go via `wrangler secret put`:
+    //   RUNPOD_API_KEY, RUNPOD_ENDPOINT_URL,
+    //   R2_ENDPOINT_URL, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME,
+    //   CDP_API_KEY_ID, CDP_API_SECRET (facilitator x402 verify/settle)
+    // SpendGuard knobs (hardcoded fallbacks live in src/spendguard.js):
+    "SG_MIN_BALANCE": "2.00",
+    "SG_MAX_JOB_COST": "0.50",
+    "SG_CPU_RATE_PER_HR": "0.13",
+    // Merchant wallet (public address — safe as a var; never put private keys here)
+    "MERCHANT_WALLET_ADDRESS": "0x795dCA28d0e8a0E5d19D689163f125a7da1D0B83"
+  },
+  "observability": { "enabled": true }
+}

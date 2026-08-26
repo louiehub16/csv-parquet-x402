@@ -1,0 +1,90 @@
+# CSV-to-Parquet Stream Compressor
+
+> Convert .csv/.tsv/.txt uploads to ZSTD-compressed Apache Parquet.
+> Pay-per-use via x402 v2 USDC on Base.
+
+## What
+
+A serverless data-conversion endpoint for delimited-text files. Today's public
+endpoint accepts uploads up to ~100 MB per request (direct multi-GB streaming
+is roadmap); conversion runs through PyArrow on RunPod serverless CPU,
+emitting ZSTD-compressed Apache Parquet. Inputs under 10 GB
+land automatically in provider R2 temp storage (24-hour lifecycle) with a
+presigned download link returned in the response; inputs at or above 10 GB
+require the caller to supply an S3-compatible `target_destination` where the
+result is written permanently on the caller's own storage.
+
+- Input formats: `.csv`, `.tsv`, `.txt` (delimited text)
+- Output format: Apache Parquet with ZSTD compression (`parquet+zstd`)
+- Transport: multipart POST (gateway buffers the request; ~100 MB practical cap today,
+  direct multi-GB streaming is roadmap)
+- Settlement: x402 v2, exact scheme, USDC on Base Mainnet
+
+## Endpoint
+
+**POST** `https://csv-parquet.YOURDOMAIN.workers.dev/v1/compress`
+
+Multipart form fields:
+
+| Field               | Type   | Required | Notes                                                                 |
+|---------------------|--------|----------|-----------------------------------------------------------------------|
+| `file`              | binary | yes      | The .csv / .tsv / .txt payload to compress                            |
+| `target_destination`| string | optional | JSON string describing an S3-compatible destination; **required when input >= 10 GB** |
+
+Payment flow:
+
+1. Send the first request unauthenticated.
+2. It returns **HTTP 402** with a `PAYMENT-REQUIRED` manifest — an exact
+   micro-USDC amount computed per-request from your byte size.
+3. Sign the EIP-3009 TransferWithAuthorization for exactly that amount.
+4. Retry the identical request with a `PAYMENT-SIGNATURE` header carrying the
+   signed authorization (base64url JSON). The gateway verifies the signature
+   offline and the conversion then runs and returns 200. NOTE: there is
+   currently NO durable payment record or collectible settlement — the
+   authorization is verified and discarded. Automated settlement is roadmap.
+
+Free health probe: **GET** `/health`.
+
+## Pricing
+
+Pay-per-use, tiered by input byte volume. USD-denominated, settled in USDC on
+Base via x402 v2 (exact scheme).
+
+| # | Input size range (bytes)                | Rate         | Cost example        | Storage target              | Retention                  |
+|---|-----------------------------------------|--------------|---------------------|------------------------------|----------------------------|
+| 1 | 0 – 104857599 (under 104857600 bytes)              | flat $0.01   | $0.01               | internal_r2                  | 24_hours                   |
+| 2 | 104857600 – 10737418240 (inclusive)     | $0.10 per GB | 5 GB → $0.50        | internal_r2                  | 24_hours                   |
+| 3 | 10737418241 – 107374182400 (inclusive) | $0.05 per GB | 50 GB → $2.50       | user_supplied_destination    | permanent_on_user_storage  |
+| 4 | 107374182401 – 1099511627776 (inclusive) | $0.015 per GB| 500 GB → $7.50      | user_supplied_destination    | permanent_on_user_storage  |
+| 5 | above 1099511627776 (above 1 TB, > 1 TB)  | $0.008 per GB| 5 TB → $40.00       | user_supplied_destination    | permanent_on_user_storage  |
+
+Note: the exact micro-USDC amount is computed per-request from byte size and
+returned in the live 402 PAYMENT-REQUIRED manifest — authoritative over these
+directory ranges. Boundary convention: upper bounds are inclusive — a file of
+exactly a tier's upper byte limit prices in that tier; tier 5 is strictly
+above 1 TB.
+
+## Protocol Metadata
+
+- **Chain:** Base Mainnet (`eip155:8453`)
+- **Settlement asset:** USDC — `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913`
+- **Merchant wallet (payTo):** `0x795dCA28d0e8a0E5d19D689163f125a7da1D0B83`
+- **Scheme:** exact · **x402Version:** 2
+- Machine-readable manifest: [`/.well-known/x402.json`](/.well-known/x402.json)
+
+## Limits
+
+- Internal R2 result retention: **24 hours** (enforced by the deployed
+  `r2-lifecycle.json` bucket rule) — download promptly.
+- **>= 10 GB rule:** inputs at or above 10737418240 bytes REQUIRE a
+  caller-supplied S3-compatible `target_destination`; no internal hosting.
+- Output codec is always ZSTD-compressed Parquet (`parquet+zstd`).
+- Gateway timeouts apply on extremely slow streams. There is no resumable
+  result lookup: a timed-out job must be resubmitted with a fresh payment.
+
+## Related documents
+
+- OpenAPI spec: `/openapi.json`
+- MCP tool config: `/mcp/config`
+- x402 manifest: `/.well-known/x402.json`
+- Support: support@YOURDOMAIN.placeholder

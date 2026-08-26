@@ -1,0 +1,228 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "CSV-to-Parquet Stream Compressor",
+    "version": "1.0.0",
+    "description": "Converts delimited-text uploadscsv/.tsv/.txt multipart uploads into ZSTD-compressed Apache Parquet via PyArrow on RunPod serverless CPU. Settled with x402 v2 USDC on Base.",
+    "contact": {
+      "email": "support@YOURDOMAIN.placeholder"
+    }
+  },
+  "servers": [
+    {
+      "url": "https://csv-parquet.YOURDOMAIN.workers.dev",
+      "description": "Cloudflare Workers gateway (placeholder domain)"
+    }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "operationId": "getHealth",
+        "summary": "Service health probe (free, no payment required)",
+        "responses": {
+          "200": {
+            "description": "Service is healthy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "ok"
+                      ]
+                    },
+                    "service_id": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "status"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/openapi.json": {
+      "get": {
+        "summary": "This OpenAPI document",
+        "description": "Serves this OpenAPI 3.1 specification (free, unauthenticated).",
+        "responses": {
+          "200": {
+            "description": "OpenAPI JSON document"
+          }
+        }
+      }
+    },
+    "/llms.txt": {
+      "get": {
+        "operationId": "getLlmsTxt",
+        "summary": "Crawler manifest (llms.txt)",
+        "responses": {
+          "200": {
+            "description": "Plain-text crawler manifest describing the service and its endpoints",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/.well-known/x402.json": {
+      "get": {
+        "operationId": "getX402DiscoveryManifest",
+        "summary": "x402 service discovery manifest",
+        "responses": {
+          "200": {
+            "description": "JSON discovery manifest describing the service, capabilities, pricing tiers, x402 payment parameters, and endpoints",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/mcp/config": {
+      "get": {
+        "operationId": "getMcpConfig",
+        "summary": "MCP tools descriptor",
+        "responses": {
+          "200": {
+            "description": "JSON MCP tools descriptor for integrating this service with Model Context Protocol clients",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/compress": {
+      "post": {
+        "operationId": "compressCsvStream",
+        "summary": "Convert a CSV/TSV/TXT file to ZSTD-compressed Parquet",
+        "description": "First unauthenticated call returns 402 with a PAYMENT-REQUIRED header manifest containing the exact micro-USDC amount for the request. Pay in USDC on Base per that manifest, then retry the identical request adding a PAYMENT-SIGNATURE header with the payment proof. Pricing tiers (upper bounds inclusive \u2014 a file of exactly an upper bound prices in that tier): under 104857600 bytes flat $0.01; up to 10737418240 bytes $0.10/GB; up to 107374182400 bytes $0.05/GB (BYO storage required >=10GB); up to 1099511627776 bytes $0.015/GB (BYO); above 1099511627776 bytes $0.008/GB (BYO). Minimum charge $0.01. The 402 manifest carries the exact micro-USDC amount.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "file": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "The .csv/.tsv/.txt payload to convert (required)"
+                  },
+                  "target_destination": {
+                    "type": "string",
+                    "description": "Optional JSON string describing an S3-compatible destination. Required when input >= 10 GiB (10737418240 bytes)."
+                  }
+                },
+                "required": [
+                  "file"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Compression succeeded; result stored at presigned R2 link or caller-supplied destination",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "success"
+                      ]
+                    },
+                    "output_bucket": {
+                      "type": "string"
+                    },
+                    "output_key": {
+                      "type": "string"
+                    },
+                    "rows": {
+                      "type": "integer"
+                    },
+                    "skipped_columns": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "skipped_rows": {
+                      "type": "integer"
+                    },
+                    "drift_fallback": {
+                      "type": "boolean",
+                      "description": "true when a mid-file type drift triggered the lossless all-string re-read"
+                    },
+                    "duration_s": {
+                      "type": "number"
+                    },
+                    "estimated_cost_usd": {
+                      "type": "number"
+                    },
+                    "download_url": {
+                      "type": "string",
+                      "description": "presigned link; internal destination only (24h retention)"
+                    },
+                    "warning": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "status",
+                    "output_bucket",
+                    "output_key",
+                    "rows"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request \u2014 missing/invalid multipart fields, unsupported input format, or missing target_destination for a >= 10 GB output"
+          },
+          "402": {
+            "description": "Payment required. The response carries a PAYMENT-REQUIRED header whose value is a base64url-encoded JSON manifest shaped exactly like the live challenge: {\"x402Version\":2,\"error\":\"Payment required\",\"resource\":{\"url\":\"https://csv-parquet.YOURDOMAIN.workers.dev/v1/compress\",\"description\":\"CSV/TSV/TXT to Parquet conversion\"},\"accepts\":[{\"scheme\":\"exact\",\"network\":\"eip155:8453\",\"amount\":\"<exact micro-USDC for this request>\",\"asset\":\"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913\",\"payTo\":\"0x795dCA28d0e8a0E5d19D689163f125a7da1D0B83\",\"maxTimeoutSeconds\":600,\"extra\":{\"name\":\"USD Coin\",\"version\":\"2\"}}]}. The client signs an EIP-3009 TransferWithAuthorization for that amount and retries the same request with a PAYMENT-SIGNATURE header carrying the signed authorization.",
+            "headers": {
+              "PAYMENT-REQUIRED": {
+                "description": "Base64url-encoded x402 v2 PAYMENT-REQUIRED manifest JSON with accepts[].amount in micro-USDC. Example (decoded): {\"x402Version\":2,\"scheme\":\"exact\",\"network\":\"eip155:8453\",\"asset\":\"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913\",\"payTo\":\"0x795dCA28d0e8a0E5d19D689163f125a7da1D0B83\",\"resource\":\"https://csv-parquet.YOURDOMAIN.workers.dev/v1/compress\",\"description\":\"CSV-to-Parquet compression of 12345678 bytes\"}",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Upstream conversion worker failed (PyArrow/RunPod error during conversion)"
+          },
+          "504": {
+            "description": "Gateway timeout \u2014 stream did not complete within the allowed window"
+          }
+        }
+      }
+    }
+  }
+}

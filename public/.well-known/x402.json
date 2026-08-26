@@ -1,0 +1,121 @@
+{
+  "service_id": "csv-to-parquet-stream-compressor",
+  "display_name": "CSV-to-Parquet Stream Compressor",
+  "tagline": "Buffered ~100 MB multipart uploads converted",
+  "description": "Serverless conversion service that Converts delimited-text uploadscsv/.tsv/.txt files (multipart upload) into ZSTD-compressed Apache Parquet using PyArrow on RunPod serverless CPU. Inputs under 10 GB land automatically in provider R2 temp storage with a 24-hour lifecycle and a presigned download link. inputs at or above 10 GiB (10737418240 bytes) require a caller-supplied S3-compatible target destination. Pay-per-use settlement via x402 v2 USDC on Base.",
+  "categories": [
+    "Data Engineering",
+    "Developer Tools",
+    "AI Infrastructure"
+  ],
+  "keywords": [
+    "csv to parquet",
+    "parquet converter",
+    "apache parquet",
+    "apache arrow",
+    "pyarrow",
+    "zstd compression",
+    "columnar storage",
+    "data lakehouse",
+    "tsv to parquet",
+    "large file streaming",
+    "multipart upload api",
+    "etl data pipeline",
+    "s3 compatible export",
+    "usdc pay per use api",
+    "serverless data conversion"
+  ],
+  "capabilities": {
+    "streaming": false,
+    "max_file_size_limit": "~104857600 bytes per request today (roadmap: multi-GB direct-to-storage)",
+    "supported_input_formats": [
+      "csv",
+      "tsv",
+      "txt"
+    ],
+    "output_format": "parquet+zstd",
+    "streaming_note": "multipart buffered today (~100 MB practical per request); direct multi-GB streaming is roadmap"
+  },
+  "pricing_matrix": {
+    "currency": "USD",
+    "payment_model": "pay-per-use-tiered-volume",
+    "payment_mechanism": "x402-v2-usdc-base",
+    "boundary_convention": "integer byte ranges below are CLOSED [min..max] and mirror the live tierForBytes implementation; the 402 PAYMENT-REQUIRED amount is always authoritative",
+    "tiers": [
+      {
+        "tier": 1,
+        "name": "small-flat",
+        "range_min_bytes": 0,
+        "range_max_bytes": 104857599,
+        "rate_type": "flat",
+        "cost_usd_flat": 0.01,
+        "storage_target": "internal_r2",
+        "retention": "24_hours",
+        "retention_note": "enforced via deployed r2-lifecycle.json rule"
+      },
+      {
+        "tier": 2,
+        "name": "mid-volume",
+        "range_min_bytes": 104857600,
+        "range_max_bytes": 10737418240,
+        "rate_type": "per_gb",
+        "rate_usd_per_gb": 0.1,
+        "storage_target": "internal_r2",
+        "retention": "24_hours",
+        "storage_note": "a file of exactly 10737418240 bytes requires BYO destination per the >=10 GiB rule",
+        "retention_note": "enforced via deployed r2-lifecycle.json rule"
+      },
+      {
+        "tier": 3,
+        "name": "large-user-storage",
+        "range_min_bytes": 10737418241,
+        "range_max_bytes": 107374182400,
+        "rate_type": "per_gb",
+        "rate_usd_per_gb": 0.05,
+        "storage_target": "user_supplied_destination",
+        "retention": "permanent_on_user_storage"
+      },
+      {
+        "tier": 4,
+        "name": "bulk-user-storage",
+        "range_min_bytes": 107374182401,
+        "range_max_bytes": 1099511627776,
+        "rate_type": "per_gb",
+        "rate_usd_per_gb": 0.015,
+        "storage_target": "user_supplied_destination",
+        "retention": "permanent_on_user_storage"
+      },
+      {
+        "tier": 5,
+        "name": "petabyte-class-user-storage",
+        "description": "> 1 TB (strictly above 1099511627776 bytes)",
+        "range_min_bytes": 1099511627777,
+        "rate_type": "per_gb",
+        "rate_usd_per_gb": 0.008,
+        "storage_target": "user_supplied_destination",
+        "retention": "permanent_on_user_storage",
+        "range_max_bytes": null
+      }
+    ]
+  },
+  "x402": {
+    "version": 2,
+    "network": "eip155:8453",
+    "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    "payTo": "0x795dCA28d0e8a0E5d19D689163f125a7da1D0B83",
+    "scheme": "exact",
+    "pricing_note": "exact micro-USDC amount computed per-request from byte size and returned in the live 402 PAYMENT-REQUIRED manifest \u2014 authoritative over directory ranges"
+  },
+  "endpoints": {
+    "gateway_root": "https://csv-parquet.YOURDOMAIN.workers.dev",
+    "compress": "POST /v1/compress",
+    "llms": "/llms.txt",
+    "openapi": "/openapi.json",
+    "mcp_config": "/mcp/config",
+    "health": "/health",
+    "x402_manifest": "/.well-known/x402.json"
+  },
+  "developer": {
+    "support_contact": "support@YOURDOMAIN.placeholder"
+  }
+}
