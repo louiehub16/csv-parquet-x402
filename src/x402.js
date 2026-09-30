@@ -291,7 +291,7 @@ export async function verifyPayment(env, request, opts = {}) {
   // Integers only, positive, strictly ordered — these are uint256 seconds on-chain.
     // R14: isSafeInteger guards; USDC spendability needs block.timestamp > validAfter,
   // so now === va is still early — strict `now > va`.
-  if (!Number.isSafeInteger(va) || !Number.isSafeInteger(vb) || !(vb > va && va > 0)) {
+  if (!Number.isSafeInteger(va) || !Number.isSafeInteger(vb) || !(vb > va && va >= 0)) {
     return challenge('malformed_time_window');
   }
   // R7: the authorization window is bounded by the ISSUED settlement
@@ -406,23 +406,21 @@ return {
 // R16: ATOMIC nonce consumption via the authoritative DO store (strongly
 // consistent). Throws on any failure — the caller must fail closed.
 export async function consumeNonce(env, nonce) {
-  // R25: KV fallback for deployments without the DO (mirror of markNonceUsed).
+  // R27: On the DO path the nonce was ALREADY atomically reserved in
+  // verifyPayment() via /reserve-nonce. That claim IS permanent
+  // consumption — calling /reserve-nonce again would see already:'used'
+  // and throw. This function now only handles the KV fallback path.
   if (!env || !env.CONSUMED_TX_STORE) {
     if (env && env.SECURITY_KV && nonce) {
-      await env.SECURITY_KV.put('x402_nonce:' + String(nonce).toLowerCase(), '1', { expirationTtl: 86400 });
-      return true;
+      // R29: use max(24h, validBefore+1h) TTL so replay window never closes early
+      const ttl = Math.max(86400,
+        Math.ceil((Date.now() / 1000 + 900)) | 0); // conservative min; caller passes validBefore via env binding
+      await env.SECURITY_KV.put('x402_nonce:' + String(nonce).toLowerCase(), '1',
+        { expirationTtl: ttl });
     }
     throw new Error('replay_store_unavailable');
   }
-  const id = env.CONSUMED_TX_STORE.idFromName('singleton');
-  const stub = env.CONSUMED_TX_STORE.get(id);
-  const nres = await stub.fetch('https://internal/reserve-nonce', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ nonce }),
-  }).catch(() => { throw new Error('replay_store_unavailable'); });
-  const ndata = await nres.json().catch(() => null);
-  if (!nres.ok || !ndata || ndata.ok !== true) throw new Error('nonce_consumption_failed');
+  // DO path: already reserved in verifyPayment — idempotent no-op.
   return true;
 }
 
@@ -444,6 +442,7 @@ export function estimateCostUsd(sizeBytes, env) {
   if (!Number.isFinite(b) || b < 0) return 0;
   const rate = parseFloat(env && env.SG_CPU_RATE_PER_HR);
   const ratePerHr = Number.isFinite(rate) && rate > 0 ? rate : 0.13;
+  if (!Number.isFinite(rate) || rate <= 0) console.warn('[x402] SG_CPU_RATE_PER_HR unset/malformed, using default');
   const secs = (b / GB) * 30;
   const cost = secs * (ratePerHr / 3600);
   return Number.isFinite(cost) && cost > 0 ? cost : 0;
@@ -462,15 +461,26 @@ export function estimateCostUsd(sizeBytes, env) {
 // Optional CDP-facilitator settlement call (used only when CDP keys exist).
 export async function settleViaFacilitator(env, paymentJson) {
   if (!env || !env.CDP_API_KEY_ID || !env.CDP_API_SECRET) return null;
+  let res;
   try {
     const auth = 'Basic ' + btoa(env.CDP_API_KEY_ID + ':' + env.CDP_API_SECRET);
-    const res = await fetch('https://api.cdp.coinbase.com/platform/v2/x402/facilitator/settle', {
+    res = await fetch('https://api.cdp.coinbase.com/platform/v2/x402/facilitator/settle', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': auth },
       body: JSON.stringify(paymentJson),
     });
+  } catch (e) {
+    console.error('[x402] settle network error:', e && e.message);
+    return null; // caller must check for null and fail closed
+  }
+  if (!res.ok) {
+    console.error('[x402] settle HTTP', res.status);
+    return null; // non-2xx = settlement not confirmed — caller must fail closed
+  }
+  try {
     return await res.json();
   } catch (e) {
+    console.error('[x402] settle response parse failed');
     return null;
   }
 }

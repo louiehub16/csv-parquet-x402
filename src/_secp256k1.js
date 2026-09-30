@@ -138,3 +138,103 @@ export function recover(msgHash, rBytes, sBytes, recId) {
     throw new RangeError('recovery produced an invalid point');
   return Q;
 }
+
+
+// ---------------------------------------------------------------- SHA-256
+// WebCrypto-backed SHA-256 (Workers runtime provides crypto.subtle). Returns
+// Uint8Array(32). Falls back to a pure-JS implementation off-Workers.
+export async function sha256(bytes) {
+  if (globalThis.crypto && globalThis.crypto.subtle) {
+    const buf = await globalThis.crypto.subtle.digest('SHA-256', bytes);
+    return new Uint8Array(buf);
+  }
+  return sha256Pure(bytes);
+}
+
+function rotr(x, n) { return (x >>> n) | (x << (32 - n)); }
+
+function sha256Pure(bytes) {
+  const K = new Uint32Array([
+    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2]);
+  const H = new Uint32Array([0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19]);
+  const msg = new Uint8Array(((bytes.length + 9) >> 6 << 6) + 64);
+  msg.set(bytes); msg[bytes.length] = 0x80;
+  const dv = new DataView(msg.buffer);
+  dv.setUint32(msg.length - 4, bytes.length * 8 >>> 0);
+  dv.setUint32(msg.length - 8, Math.floor(bytes.length * 8 / 4294967296));
+  const w = new Uint32Array(64);
+  for (let off = 0; off < msg.length; off += 64) {
+    for (let i = 0; i < 16; i++) w[i] = dv.getUint32(off + i * 4);
+    for (let i = 16; i < 64; i++) {
+      const a = w[i-15], b = w[i-2];
+      const s0 = rotr(a,7) ^ rotr(a,18) ^ (a >>> 3);
+      const s1 = rotr(b,17) ^ rotr(b,19) ^ (b >>> 10);
+      w[i] = (w[i-16] + s0 + w[i-7] + s1) >>> 0;
+    }
+    let [a,b,c,d,e,f,g,h] = H;
+    for (let i = 0; i < 64; i++) {
+      const S1 = rotr(e,6) ^ rotr(e,11) ^ rotr(e,25);
+      const ch = (e & f) ^ (~e & g);
+      const t1 = (h + S1 + ch + K[i] + w[i]) >>> 0;
+      const S0 = rotr(a,2) ^ rotr(a,13) ^ rotr(a,22);
+      const mj = (a & b) ^ (a & c) ^ (b & c);
+      const t2 = (S0 + mj) >>> 0;
+      h=g; g=f; f=e; e=(d+t1)>>>0; d=c; c=b; b=a; a=(t1+t2)>>>0;
+    }
+    H[0]=(H[0]+a)>>>0; H[1]=(H[1]+b)>>>0; H[2]=(H[2]+c)>>>0; H[3]=(H[3]+d)>>>0;
+    H[4]=(H[4]+e)>>>0; H[5]=(H[5]+f)>>>0; H[6]=(H[6]+g)>>>0; H[7]=(H[7]+h)>>>0;
+  }
+  const out = new Uint8Array(32);
+  const odv = new DataView(out.buffer);
+  for (let i = 0; i < 8; i++) odv.setUint32(i * 4, H[i]);
+  return out;
+}
+
+// ------------------------------------------------------- ECDSA signing
+// Deterministic k = SHA256(privkey || digest || counter) mod n. NOT RFC 6979
+// (we have no HMAC primitive here), but the facilitator only VERIFIES the
+// signature — it does not require RFC-6979 determinism. k is unguessable and
+// never reused across differing digests, which is what actually matters.
+// Returns { r, s, recovery } as bigints. Enforces low-s (EIP-2), matching
+// OpenZeppelin/USDC verification.
+export async function signDigest(digest32, privBytes) {
+  const d = bytesToBigInt(privBytes);
+  if (d <= 0n || d >= N) throw new RangeError('private key out of range');
+  const z = bytesToBigInt(digest32);
+  const dBytes = bigIntToBytes32(d);
+  for (let counter = 0; counter < 256; counter++) {
+    const seed = new Uint8Array(32 + 32 + 1);
+    seed.set(dBytes, 0);
+    seed.set(digest32, 32);
+    seed[64] = counter & 0xff;
+    const kb = await sha256(seed);
+    const k = bytesToBigInt(kb);
+    if (k <= 0n || k >= N) continue;
+    const R = scalarMult(k, G);
+    if (!R) continue;
+    const r = R.x % N;
+    if (r === 0n) continue;
+    const kInv = modInv(k, N);
+    let s = (kInv * (z + r * d)) % N;
+    if (s === 0n) continue;
+    // EIP-2 low-s normalization so on-chain verifiers that reject high-s
+    // (USDC / OpenZeppelin) accept the signature.
+    if (s > N / 2n) s = N - s;
+    // Recovery id for the LOW-S-normalized signature.
+    // Unnormalized:  v = (R.y & 1) | (R.x > n ? 2 : 0)
+    // When s > n/2 we flip s -> n-s, which negates the public key to (Qx, n-Ry);
+    // negating flips the y parity, so the recovery bit must be INVERTED.
+    const overflowed = R.x >= N;
+    const parity = (R.y & 1n ? 1 : 0) ^ 1;   // inverted by low-s normalization
+    const recovery = (parity ^ (overflowed ? 1 : 0)) & 1;
+    return { r, s, recovery };
+  }
+  throw new Error('signDigest: exhausted k candidates');
+}

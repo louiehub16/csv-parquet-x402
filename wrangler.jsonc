@@ -25,7 +25,8 @@
     // Public config only — secrets go via `wrangler secret put`:
     //   RUNPOD_API_KEY, RUNPOD_ENDPOINT_URL,
     //   R2_ENDPOINT_URL, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME,
-    //   CDP_API_KEY_ID, CDP_API_SECRET (facilitator x402 verify/settle)
+    //   CDP_API_KEY_ID, CDP_API_KEY_SECRET (facilitator verify/settle;
+    //   cdp.js reads CDP_API_KEY_SECRET)
     // SpendGuard knobs (hardcoded fallbacks live in src/spendguard.js):
     "SG_MIN_BALANCE": "2.00",
     // Ceiling matches the max internal-tier price for a single file (10 GiB @ $0.10/GB = $1.00)

@@ -5,6 +5,8 @@
 import {
   tierForBytes, buildChallenge, verifyPayment, markNonceUsed, estimateCostUsd, consumeNonce,
 } from './x402.js';
+// CDP facilitator adapter (settlement rail) — installed for auto-indexing + collectibility.
+import { cdpConfigured, cdpVerifyAndSettle } from './cdp.js';
 // SpendGuard (R12.5) — financial guard rails + atomic budget ledger (reviewer-hardened
 // through 12 rounds on the docker-on-tap project; see REVIEW_LEDGER.md).
 import * as spendguard from './spendguard.js';
@@ -155,6 +157,9 @@ export default {
       //     HONEST CAP: request.formData() buffers the whole upload in isolate
       //     memory (~128 MB practical ceiling); the multi-GB tiers assume
       //     presigned-direct ingestion (roadmap). Comment only — no rejection.
+      // R28: hoisted so the outer catch block can access them for cleanup
+      let v = null;
+      let budgetTxId = null;
       let form;
       try { form = await request.formData(); } catch (e) { return json({ error: 'bad_multipart' }, 400); }
       const file = form.get('file');
@@ -179,8 +184,14 @@ export default {
             (bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46))
           return json({ error: 'archive_or_binary_detected' }, 400);
         let text;
-        try { text = new TextDecoder('utf-8', { fatal: true }).decode(bytes); }
-        catch (e) { return json({ error: 'invalid_utf8' }, 400); }
+        try {
+          // Strip trailing bytes that could be part of a truncated multi-byte
+          // UTF-8 sequence at the 1 MB slice boundary (R26 fix: false invalid_utf8).
+          let end = bytes.length;
+          while (end > 0 && (bytes[end - 1] & 0xC0) === 0x80) end--;
+          if (end > 0 && (bytes[end - 1] & 0x80) !== 0) end--; // strip lead byte too
+          text = new TextDecoder('utf-8', { fatal: true }).decode(bytes.slice(0, end));
+        } catch (e) { return json({ error: 'invalid_utf8' }, 400); }
         if (text.includes('\u0000')) return json({ error: 'null_byte_detected' }, 400);
         if (![/[,]/, /[;]/, /\t/, /\n/].some((re) => re.test(text)))
           return json({ error: 'no_delimiters_detected' }, 400);
@@ -264,8 +275,28 @@ export default {
           statusNote: 'payment header exceeds 2048-byte limit',
         });
       }
-      const v = await verifyPayment(env, request, { expectedAmount: tier.microUsdc });
+      v = await verifyPayment(env, request, { expectedAmount: tier.microUsdc });
       if (!v.ok) return v.failResponse;
+
+      // (8.1) CDP FACILITATOR SETTLEMENT — when configured, verify+settle the
+      //       signed authorization through Coinbase's facilitator. This is the
+      //       rail that makes the payment COLLECTIBLE and seeds Bazaar /
+      //       x402scan auto-indexing. A permanent rejection aborts the request
+      //       (402); a transient failure falls through to the offline path.
+      if (v.ok && cdpConfigured(env)) {
+        const payHeaderB64 = request.headers.get('PAYMENT-SIGNATURE') || request.headers.get('X-PAYMENT') || '';
+        const cdpRes = await cdpVerifyAndSettle(env, payHeaderB64, 'csv-parquet-stream-compressor', tier.microUsdc);
+        if (cdpRes.ok) {
+          v.settledTx = cdpRes.settledTx || null;
+        } else if (!cdpRes.retryable) {
+          // Genuine payment rejection — do NOT serve.
+          return json({ error: 'payment_rejected', reason: cdpRes.reason || 'facilitator_rejected' }, 402);
+        } else {
+          // Facilitator unavailable/ambiguous: the signed authorization remains
+          // valid on-chain, so the offline verification stands.
+          v.settlePending = true;
+        }
+      }
 
       // (9) UPSTREAM DISPATCH — client disconnect aborts the upstream job too
       //     (we stop paying for abandoned work).
@@ -316,7 +347,7 @@ export default {
       // (8.5) ATOMIC BUDGET RESERVATION (SpendGuard DO) — payment already
       //     verified; from here every exit path spends money, so the
       //     reservation intentionally stands (no leak possible downstream).
-      const budgetTxId = 'conv-' + crypto.randomUUID();
+      budgetTxId = 'conv-' + crypto.randomUUID();
       {
         const res = await reserveDailyBudget(env, est, budgetTxId);
         if (!res.ok) {
@@ -449,6 +480,8 @@ export default {
       const ALLOWED = ['status','output_bucket','output_key','rows','skipped_columns','skipped_rows','drift_fallback','duration_s','estimated_cost_usd','download_url','warning'];
       const body = {};
       for (const k of ALLOWED) if (parsed[k] !== undefined) body[k] = parsed[k];
+      if (v && v.settledTx) body.settled_tx = v.settledTx;
+      else if (v && v.settlePending) body.settle_pending = true;
       // OX-ALPHA: settle the gate 8.5 estimate against the engine-reported
       // ACTUAL cost now that the allowlist body is built. The DO keys
       // reconciles by kind, so the ':reconcile' transaction id records the
@@ -496,6 +529,21 @@ export default {
       return json(body, upstream.status);
     } catch (e) {
       // FAIL-CLOSED catch-all: an internal error never becomes a free job.
+      // R26c/R29: release nonce claim AND reconcile budget reservation on errors.
+      try {
+        if (typeof budgetTxId === 'string' && budgetTxId) {
+          ctx.waitUntil(reconcileDailyBudget(env, budgetTxId + ':reconcile', 0).catch(() => {}));
+        }
+      } catch (_) {}
+      try {
+        if (env.CONSUMED_TX_STORE && typeof v !== 'undefined' && v && v.nonce) {
+          const id2 = env.CONSUMED_TX_STORE.idFromName('singleton');
+          const stub2 = env.CONSUMED_TX_STORE.get(id2);
+          await stub2.fetch('https://internal/release-nonce', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ nonce: v.nonce }) });
+        }
+      } catch (_) {}
       return json({ error: 'internal_error' }, 500);
     }
   },
