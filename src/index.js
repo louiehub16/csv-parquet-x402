@@ -283,17 +283,28 @@ export default {
       //       rail that makes the payment COLLECTIBLE and seeds Bazaar /
       //       x402scan auto-indexing. A permanent rejection aborts the request
       //       (402); a transient failure falls through to the offline path.
+      // R36: offline signature verification alone is NOT payment. If the
+      // facilitator is not configured, refuse the paid work — delivering here
+      // would hand out infrastructure that can never be collected.
+      if (v.ok && !cdpConfigured(env)) {
+        return json({ error: 'settlement_not_configured',
+          message: 'Payment settlement is not configured; refusing unpaid delivery.' }, 503);
+      }
       if (v.ok && cdpConfigured(env)) {
         const payHeaderB64 = request.headers.get('PAYMENT-SIGNATURE') || request.headers.get('X-PAYMENT') || '';
-        const cdpRes = await cdpVerifyAndSettle(env, payHeaderB64, 'csv-parquet-stream-compressor', tier.microUsdc);
+        const cdpRes = await cdpVerifyAndSettle(env, payHeaderB64, 'csv-parquet-stream-compressor', tier.microUsdc, tier.microUsdc);
         if (cdpRes.ok) {
           v.settledTx = cdpRes.settledTx || null;
         } else if (!cdpRes.retryable) {
           // Genuine payment rejection — do NOT serve.
           return json({ error: 'payment_rejected', reason: cdpRes.reason || 'facilitator_rejected' }, 402);
+        } else if (cdpRes.settledUnknown) {
+          // Settlement outcome UNKNOWN (may or may not have moved on-chain).
+          // Delivering now risks unpaid work; refusing is safe and correct.
+          return json({ error: 'settlement_unconfirmed', reason: cdpRes.reason || 'settlement_ambiguous' }, 503);
         } else {
-          // Facilitator unavailable/ambiguous: the signed authorization remains
-          // valid on-chain, so the offline verification stands.
+          // Facilitator verifiably rejected with a transient error (e.g. its own
+          // outage) and NOTHING was submitted: the offline path stands.
           v.settlePending = true;
         }
       }
@@ -510,12 +521,13 @@ export default {
       // DO (strongly consistent). Fail-closed: if consumption cannot be
       // confirmed we refuse delivery — a replayable paid output is worse
       // than a retry. KV fallback burns best-effort with documented race.
-      // R25: nonce was atomically CLAIMED at gate 8 via DO reserve-nonce; the
-      // claim IS permanent consumption. No further burn needed on DO path.
-      // KV fallback deployments still burn here (best-effort, documented race).
-      if (!env.CONSUMED_TX_STORE) {
+      // R34 FINALIZE: the gate-8 reservation is now made permanent by
+      // consumeNonce (DO atomic finalize, or a validBefore-aware KV marker).
+      // Failure here is fatal — a nonce that can't be burned means this
+      // authorization may be replayed, so we must not hand back the output.
+      {
         try {
-          await markNonceUsed(env, v.nonce, v.validBefore);
+          await consumeNonce(env, v.nonce, v.validBefore);
         } catch (e) {
           // OX-ALPHA: KV burn failed -> reconcile to est (NOT $0) since the job
           // ran and billed compute; refusing delivery would waste it.

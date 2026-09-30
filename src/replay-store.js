@@ -27,6 +27,20 @@ export class ConsumedTxStore {
     }
     // R25: release a pre-dispatch nonce claim when upstream dispatch fails
     // (no compute bought) — so failed jobs don't burn valid nonces.
+    // R34: finalize a VERIFIED+claimed nonce as permanently consumed.
+    // Distinct from /reserve-nonce (which 409s on an existing key) so the
+    // post-delivery burn is idempotent and cannot race itself.
+    if (method === "POST" && pathname === "/finalize-nonce") {
+      const body = await this.readBody(request);
+      if (!body || body.nonce == null) return this.json({ ok: false, error: "invalid_json" }, 400);
+      const key = "nonce:" + String(body.nonce);
+      const rec = await this.state.storage.get(key);
+      if (!rec) return this.json({ ok: false, error: "nonce_not_claimed" }, 409);
+      rec.finalized = true;
+      rec.finalizedAt = Date.now();
+      await this.state.storage.put(key, rec);
+      return this.json({ ok: true, finalized: true }, 200);
+    }
     if (method === "POST" && pathname === "/release-nonce") {
       const body = await this.readBody(request);
       if (!body || body.nonce == null) return this.json({ ok: false, error: "invalid_json" }, 400);

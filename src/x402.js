@@ -237,7 +237,12 @@ export async function verifyPayment(env, request, opts = {}) {
   });
 
   if (!payTo) return challenge('server_not_configured', 500);
-  if (!expected || !/^[0-9]+$/.test(expected)) return challenge('unpriceable_request');
+  // R35: reject a ZERO price. A zero-value authorization is well-formed and
+  // would recover to the payer, but it buys nothing — serving it would hand
+  // paid infrastructure away for free.
+  if (!expected || !/^[0-9]+$/.test(expected) || expected === '0') {
+    return challenge('unpriceable_request');
+  }
 
   const header = request.headers.get('PAYMENT-SIGNATURE') || request.headers.get('X-PAYMENT');
   if (!header) return challenge('payment_signature_header_missing');
@@ -330,6 +335,14 @@ export async function verifyPayment(env, request, opts = {}) {
       vRaw = sig.v != null ? Number(sig.v) : (sig.recovery != null ? Number(sig.recovery) : undefined);
     }
     if (!/^[0-9a-f]{64}$/.test(rHex) || !/^[0-9a-f]{64}$/.test(sHex)) throw new RangeError('bad r/s');
+    // R31: enforce EIP-2 low-s HERE, not only in recover(). USDC / OpenZeppelin
+    // verification rejects high-s, so a high-s signature that recovers to the
+    // right signer locally would still be uncollectible on-chain.
+    {
+      const sBi = BigInt('0x' + sHex);
+      const HALF = 0x7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0n;
+      if (sBi > HALF) throw new RangeError('high-s signature');
+    }
     let recId;
     if (vRaw === 27 || vRaw === 28) recId = vRaw - 27;
     else if (vRaw === 0 || vRaw === 1) recId = vRaw;
@@ -352,10 +365,15 @@ export async function verifyPayment(env, request, opts = {}) {
   // once, after validated upstream success (gateway calls consumeNonce).
   // Authoritative store: CONSUMED_TX_STORE (DO, strongly consistent) when
   // present; SECURITY_KV is the legacy fallback. Fail-closed on any store
-  // unavailability. Documented race window (KV fallback path only): two
-  // concurrent requests can both pass this read before either consumes —
-  // bounded by same-amount valid-signature requirement + daily budget cap.
-  if (env.CONSUMED_TX_STORE) {
+  // unavailability.
+  // R33: the replay store MUST be the strongly-consistent Durable Object. A
+  // SECURITY_KV-only deployment cannot make claim+consume atomic, so two
+  // concurrent requests can both pass the check and both receive paid
+  // service. Fail closed instead of serving with a non-atomic guard.
+  if (!env.CONSUMED_TX_STORE) {
+    return challenge('replay_store_unavailable', 503);
+  }
+  {
     try {
       // R25: ATOMIC PRE-DISPATCH CLAIM via DO reserve-nonce — eliminates the
       // double-delivery TOCTOU (two concurrent same-nonce requests both passed a
@@ -377,23 +395,29 @@ export async function verifyPayment(env, request, opts = {}) {
     } catch (e) {
       return challenge('replay_store_unavailable', 503); // fail closed
     }
-  } else if (env.SECURITY_KV) {
-    try {
-      const seen = await env.SECURITY_KV.get('x402_nonce:' + nonceHex);
-      if (seen) return challenge('nonce_already_used', 409);
-    } catch (e) {
-      return challenge('replay_store_unavailable', 503); // fail closed
-    }
-  } else {
-    return challenge('replay_store_unavailable', 503); // no replay store => fail closed
   }
 
-return {
+  return {
     ok: true,
     payer: auth.from,
     amountMicro: Number(auth.value),
     nonce: nonceHex,
     validBefore: Number(auth.validBefore),
+    // R33: hand the caller the VERIFIED authorization and the raw envelope so
+    // the settlement step can act on it. Discarding it here is exactly what
+    // left accepted payments uncollectible.
+    authorization: {
+      from: auth.from, to: auth.to, value: String(auth.value),
+      validAfter: Number(auth.validAfter), validBefore: Number(auth.validBefore),
+      nonce: nonceHex,
+    },
+    paymentPayload: payment,
+    // R36: settlement is NOT the verifier's job and is deliberately not done
+    // here — the gateway MUST route this payload through cdp.js
+    // (cdpVerifyAndSettle) and refuse to dispatch unless a transaction hash is
+    // returned. verified:false is a machine-readable reminder that an offline
+    // signature check alone never constitutes payment.
+    verified: false,
   };
 }
 
@@ -405,23 +429,45 @@ return {
 // surface it; silently swallowing would hide replayable payments.
 // R16: ATOMIC nonce consumption via the authoritative DO store (strongly
 // consistent). Throws on any failure — the caller must fail closed.
-export async function consumeNonce(env, nonce) {
+export async function consumeNonce(env, nonce, validBeforeSeconds) {
   // R27: On the DO path the nonce was ALREADY atomically reserved in
   // verifyPayment() via /reserve-nonce. That claim IS permanent
   // consumption — calling /reserve-nonce again would see already:'used'
   // and throw. This function now only handles the KV fallback path.
   if (!env || !env.CONSUMED_TX_STORE) {
     if (env && env.SECURITY_KV && nonce) {
-      // R29: use max(24h, validBefore+1h) TTL so replay window never closes early
-      const ttl = Math.max(86400,
-        Math.ceil((Date.now() / 1000 + 900)) | 0); // conservative min; caller passes validBefore via env binding
+      // KV-only deployment: write the consumed marker, then report SUCCESS.
+      // (R30: a successful put that then throws made callers treat a completed
+      // consumption as a replay-store outage.)
+      // R33: hold the marker until the authorization could no longer settle,
+      // so the entry never expires while the payment is still collectible.
+      const nowS = Math.floor(Date.now() / 1000);
+      const vb = Number(validBeforeSeconds);
+      const ttl = Number.isFinite(vb) && vb > 0
+        ? Math.max(86400, Math.ceil(vb - nowS) + 3600)
+        : 86400;
       await env.SECURITY_KV.put('x402_nonce:' + String(nonce).toLowerCase(), '1',
         { expirationTtl: ttl });
+      return true;
     }
     throw new Error('replay_store_unavailable');
   }
-  // DO path: already reserved in verifyPayment — idempotent no-op.
-  return true;
+  // DO path: the reservation made at verification time is now FINALIZED —
+  // successful delivery burns the nonce permanently. If the reservation had
+  // been released on an upstream failure, this returns 409 and the caller
+  // treats it as a lost race (fail closed) rather than serving free work.
+  {
+    const id = env.CONSUMED_TX_STORE.idFromName('singleton');
+    const stub = env.CONSUMED_TX_STORE.get(id);
+    const res = await stub.fetch('https://internal/finalize-nonce', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ nonce }),
+    }).catch(() => { throw new Error('replay_store_unavailable'); });
+    const data = await res.json().catch(() => null);
+    if (!res.ok || !data || data.ok !== true) throw new Error('nonce_finalize_failed');
+    return true;
+  }
 }
 
 export async function markNonceUsed(env, nonce, validBeforeSeconds) {
@@ -459,28 +505,11 @@ export function estimateCostUsd(sizeBytes, env) {
 // verified authorization payload is currently DISCARDED after verification —
 // there is no durable payment record and no collectible settlement exists.
 // Optional CDP-facilitator settlement call (used only when CDP keys exist).
-export async function settleViaFacilitator(env, paymentJson) {
-  if (!env || !env.CDP_API_KEY_ID || !env.CDP_API_SECRET) return null;
-  let res;
-  try {
-    const auth = 'Basic ' + btoa(env.CDP_API_KEY_ID + ':' + env.CDP_API_SECRET);
-    res = await fetch('https://api.cdp.coinbase.com/platform/v2/x402/facilitator/settle', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': auth },
-      body: JSON.stringify(paymentJson),
-    });
-  } catch (e) {
-    console.error('[x402] settle network error:', e && e.message);
-    return null; // caller must check for null and fail closed
-  }
-  if (!res.ok) {
-    console.error('[x402] settle HTTP', res.status);
-    return null; // non-2xx = settlement not confirmed — caller must fail closed
-  }
-  try {
-    return await res.json();
-  } catch (e) {
-    console.error('[x402] settle response parse failed');
-    return null;
-  }
-}
+// settleViaFacilitator — REMOVED (R34).
+// The only settlement implementation is cdp.js::cdpVerifyAndSettle, which
+// performs verify + settle, validates the documented success indicator AND
+// requires a provable transaction hash before reporting ok:true. This module
+// previously carried a second, weaker stub that accepted any 2xx body as
+// settlement — a paid-service-without-collection path. Do not reintroduce it;
+// import cdpVerifyAndSettle instead.
+

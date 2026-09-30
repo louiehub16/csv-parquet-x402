@@ -19,6 +19,10 @@
 //   { mode:'cdp', ok:true,  settledTx, amountMicroUsdc, payer }
 //   { mode:'cdp', ok:false, retryable:true }              // CDP down/ambiguous -> caller may fall back
 //   { mode:'cdp', ok:false, retryable:false, reason }     // genuine payment rejection -> no fallback
+//
+// minMicroUsdc     : floor (cheap sanity bound)
+// expectedAmountUsdc: the EXACT price the server computed from the request byte size;
+//                    when provided, the client's declared amount must equal it exactly.
 
 import { sha256, signDigest } from './_secp256k1.js';
 import { keccak256 } from './x402.js';
@@ -201,14 +205,32 @@ function isRejectionReason(reason) {
 }
 
 function decodePaymentPayload(b64) {
+  if (typeof b64 !== 'string' || !b64.length) return null;
   try {
     const obj = JSON.parse(new TextDecoder().decode(b64uToBytes(b64)));
-    return obj && typeof obj === 'object' ? obj : null;
+    return obj && typeof obj === 'object' && !Array.isArray(obj) ? obj : null;
   } catch (e) { return null; }
 }
 
+// Facilitator error text can echo back payment payloads or credential fragments.
+// Never propagate it: only codes WE define are ever returned.
+const ALLOWED_REASONS = new Set([
+  'malformed_payment_payload', 'missing_accepts', 'malformed_amount', 'underpayment',
+  'amount_mismatch', 'verify_failed', 'settle_failed', 'settle_unconfirmed',
+  'settle_tx_unproven', 'expected_amount_missing', 'expected_amount_config_invalid',
+  'min_amount_config_invalid',
+]);
+function safeReason(body, fallback) {
+  const r = reasonString(body);
+  // Only pass through a code that is in our own vocabulary; anything else
+  // (including a short facilitator string that happens to look like a token)
+  // collapses to the caller's internal fallback.
+  if (r && ALLOWED_REASONS.has(r)) return r;
+  return fallback;
+}
+
 // ------------------------------------------------------------- MAIN ENTRY
-export async function cdpVerifyAndSettle(env, paymentHeaderB64, resourceName, minMicroUsdc) {
+export async function cdpVerifyAndSettle(env, paymentHeaderB64, resourceName, minMicroUsdc, expectedAmountUsdc) {
   if (!cdpConfigured(env)) return { mode: 'cdp', ok: false, retryable: true };
 
   const payload = decodePaymentPayload(paymentHeaderB64);
@@ -227,9 +249,47 @@ export async function cdpVerifyAndSettle(env, paymentHeaderB64, resourceName, mi
   if (!/^(?:0|[1-9][0-9]*)$/.test(rawAmount)) {
     return { mode: 'cdp', ok: false, retryable: false, reason: 'malformed_amount' };
   }
+  // R15 SECURITY: the client-declared amount is checked against the floor ONLY,
+  // which let a client underpay (e.g. declare 1 against a 10000 tier price).
+  // When the server passes expectedAmountUsdc (the exact price it computed from
+  // the request's byte size), require EXACT equality here. A mismatch is a
+  // genuine payment rejection — never fall back to the offline path, which
+  // would apply the same lenient floor.
+  // R16: the exact server price is MANDATORY — settling against the floor
+  // alone is what allowed a client to declare a tiny amount and still pass.
+  // A missing/invalid expectedAmount is a server misconfiguration: fail
+  // closed and retryable (never settle with the weaker check).
+  if (expectedAmountUsdc == null) {
+    console.error('[cdp] expectedAmountUsdc missing — refusing to settle on floor only');
+    return { mode: 'cdp', ok: false, retryable: true, reason: 'expected_amount_missing' };
+  }
+  let expected = null;
+  try {
+    expected = BigInt(String(expectedAmountUsdc));
+  } catch (e) {
+    console.error('[cdp] invalid expectedAmountUsdc config:', String(expectedAmountUsdc));
+    return { mode: 'cdp', ok: false, retryable: true, reason: 'expected_amount_config_invalid' };
+  }
+  if (expected < 0n) {
+    return { mode: 'cdp', ok: false, retryable: true, reason: 'expected_amount_config_invalid' };
+  }
+  if (BigInt(rawAmount) !== expected) {
+    return { mode: 'cdp', ok: false, retryable: false, reason: 'amount_mismatch' };
+  }
   // Enforce the minimum HERE: otherwise a client-supplied amount of 1 would
   // settle and return ok:true, and the caller would skip the legacy verifier.
-  const required = minMicroUsdc != null ? BigInt(minMicroUsdc) : 0n;
+  // Guard the conversion: minMicroUsdc is server config, but a malformed value
+  // must degrade to a retryable result, never throw out of this function.
+  let required = 0n;
+  if (minMicroUsdc != null) {
+    try {
+      required = BigInt(String(minMicroUsdc));
+    } catch (e) {
+      console.error('[cdp] invalid minMicroUsdc config:', String(minMicroUsdc));
+      return { mode: 'cdp', ok: false, retryable: true, reason: 'min_amount_config_invalid' };
+    }
+    if (required < 0n) return { mode: 'cdp', ok: false, retryable: true, reason: 'min_amount_config_invalid' };
+  }
   if (required > 0n && BigInt(rawAmount) < required) {
     return { mode: 'cdp', ok: false, retryable: false, reason: 'underpayment' };
   }
@@ -252,12 +312,12 @@ export async function cdpVerifyAndSettle(env, paymentHeaderB64, resourceName, mi
       const perm = isPermanentRejection(verifyRes.status, errBody);
       return {
         mode: 'cdp', ok: false, retryable: !perm,
-        reason: (errBody && errBody.error) || `verify_http_${verifyRes.status}`,
+        reason: safeReason(errBody, `verify_http_${verifyRes.status}`),
       };
     }
     const vData = await verifyRes.json();
     if (!vData || vData.isValid !== true) {
-      const reason = (vData && vData.invalidReason) || (vData && vData.error) || 'verify_failed';
+      const reason = safeReason(vData, 'verify_failed');
       return { mode: 'cdp', ok: false, retryable: !isRejectionReason(reason), reason };
     }
 
@@ -275,17 +335,33 @@ export async function cdpVerifyAndSettle(env, paymentHeaderB64, resourceName, mi
     });
     if (!settleRes.ok) {
       const sErr = await settleRes.json().catch(() => ({}));
-      const perm = isPermanentRejection(settleRes.status, sErr);
+      // R16: once /settle has been SUBMITTED, any non-definitive status
+      // (408/425/429/5xx, and a 4xx whose body doesn't name a payment fault)
+      // is AMBIGUOUS: the transfer may or may not have executed. Only a
+      // provable payment verdict (400/402/409 naming the payment) is a clean
+      // "not paid" answer. Everything else is settled-unknown so the caller
+      // cannot fall back and re-serve the same authorization.
+      if (isPermanentRejection(settleRes.status, sErr)) {
+        return {
+          mode: 'cdp', ok: false, retryable: false,
+          reason: safeReason(sErr, `settle_http_${settleRes.status}`),
+        };
+      }
+      console.error('[cdp] settle ambiguous status', settleRes.status);
       return {
-        mode: 'cdp', ok: false, retryable: !perm,
-        reason: (sErr && sErr.error) || `settle_http_${settleRes.status}`,
+        mode: 'cdp', ok: false, retryable: false, settledUnknown: true,
+        reason: safeReason(sErr, `settle_ambiguous_${settleRes.status}`),
       };
     }
     const sData = await settleRes.json();
     if (!sData || sData.success !== true) {
-      // 2xx without success -> retryable unless an explicit payment rejection.
-      const reason = (sData && sData.error) || 'settle_failed';
-      return { mode: 'cdp', ok: false, retryable: !isRejectionReason(reason), reason };
+      // 2xx without success: only an explicit payment-phase reason is a clean
+      // rejection; anything else is an ambiguous post-submission state.
+      const reason = safeReason(sData, 'settle_failed');
+      if (isRejectionReason(reason)) {
+        return { mode: 'cdp', ok: false, retryable: false, reason };
+      }
+      return { mode: 'cdp', ok: false, retryable: false, settledUnknown: true, reason: 'settle_unconfirmed' };
     }
 
     const payer = (payload.from && typeof payload.from === 'string')
@@ -293,15 +369,29 @@ export async function cdpVerifyAndSettle(env, paymentHeaderB64, resourceName, mi
       : (payload.authorization && payload.authorization.from
         ? String(payload.authorization.from).toLowerCase() : null);
 
+    // R17: a success flag WITHOUT a transaction identifier is unprovable
+    // settlement. Require a real tx hash — the caller records it as the
+    // payment's durable proof, and an unprovable settle must not unlock work.
+    const settledTx = sData.transaction || sData.txHash ||
+      (sData.settlement && sData.settlement.txHash) || null;
+    if (typeof settledTx !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(settledTx)) {
+      console.error('[cdp] settle reported success without a transaction hash');
+      return { mode: 'cdp', ok: false, retryable: false, settledUnknown: true, reason: 'settle_tx_unproven' };
+    }
     return {
       mode: 'cdp',
       ok: true,
-      settledTx: sData.transaction || sData.txHash || (sData.settlement && sData.settlement.txHash) || null,
+      settledTx,
       amountMicroUsdc: rawAmount, // canonical integer string — safe for BigInt()
       payer,
     };
   } catch (e) {
-    // Any unexpected error is retryable — the caller falls back automatically.
-    return { mode: 'cdp', ok: false, retryable: true };
+    // Ambiguous settlement state (transport error / unparsed body). The
+    // authorization MAY or MAY NOT have settled on-chain, so we must NOT let the
+    // caller treat this as a clean "not paid" and re-serve the same
+    // authorization. Report it as UNSETTLED: the gateway must stop and require a
+    // fresh payment, rather than falling back to the offline path.
+    console.error('[cdp] settlement outcome ambiguous:', (e && e.message) || e);
+    return { mode: 'cdp', ok: false, retryable: false, reason: 'settlement_ambiguous', settledUnknown: true };
   }
 }
