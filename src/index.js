@@ -740,8 +740,35 @@ export default {
                 // R85: a timeout may leave compute running and billing, so the
                 // payer is NOT auto-refunded (that would lose real spend). The
                 // claim and reservation both stand; support can settle it.
-                return json({ error: 'gateway_timeout', refund: 'not_applicable',
-                  note: 'upstream job may still be running; support will reconcile' },
+                // R25: that decision must be DURABLE. Previously the outcome
+                // existed only in this isolate's memory, so once the request
+                // ended nothing recorded that a settled payer was owed a
+                // reconciliation -- funds could sit stranded with no sweepable
+                // state. Persist an idempotent claim keyed by the nonce, and
+                // report honestly whether the payment had been collected.
+                if (v && v.nonce) {
+                  const timeoutState = {
+                    nonce: v.nonce, payer: v.payer || null,
+                    amountUsdc: tier.microUsdc, reason: 'upstream_timeout',
+                    settled: paymentSettled === true,
+                    settledTx: (v && v.settledTx) || null,
+                    budgetTxId: budgetTxId || null,
+                    at: Date.now(), status: 'awaiting_reconciliation',
+                  };
+                  ctx.waitUntil(env.SECURITY_KV.put('timeout:' + v.nonce,
+                    JSON.stringify(timeoutState), { expirationTtl: 604800 })
+                    .catch(() => {}));
+                  console.error('[gateway] post-settlement timeout for', v.nonce,
+                    paymentSettled ? '(payment COLLECTED - reconciliation owed)'
+                                   : '(payment not yet settled)');
+                }
+                // Never auto-refund here (compute may still be billing), so the
+                // honest label depends on whether funds were actually collected.
+                return json({ error: 'gateway_timeout',
+                  refund: paymentSettled ? 'required' : 'not_applicable',
+                  note: paymentSettled
+                    ? 'payment was collected but the conversion timed out; a reconciliation claim is recorded and support will settle it'
+                    : 'upstream job may still be running; support will reconcile' },
                   504);
               }
               // R24 + OX-ALPHA: only a genuine network drop that occurs before
