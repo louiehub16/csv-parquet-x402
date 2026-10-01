@@ -480,6 +480,20 @@ export async function verifyPayment(env, request, opts = {}) {
     }
     if (settlement && settlement.definitelyNotSubmitted === true) {
       await releaseNonceClaim(env, nonceHex);
+      return challenge('settlement_unconfirmed', 503);
+    }
+    // R20: an AMBIGUOUS settlement (settledUnknown) means the facilitator took
+    // the submission and we cannot prove whether funds moved. Returning a bare
+    // 503 discarded that signal: the nonce stayed claimed, NO refund was
+    // scheduled, and potentially collected USDC was stranded. Treat it exactly
+    // like the other "paid but unprovable" branches — refundable, and never
+    // released so the authorization cannot be replayed.
+    if (settlement && (settlement.settledUnknown === true || settlement.refundRequired === true)) {
+      return {
+        ok: false, paid: true, refundRequired: true,
+        reason: (settlement.reason || 'settlement_unconfirmed'),
+        payer: auth.from, nonce: nonceHex, amountUsdc: String(auth.value),
+      };
     }
     return challenge('settlement_unconfirmed', 503);
   }
@@ -506,7 +520,13 @@ export async function verifyPayment(env, request, opts = {}) {
         from: auth.from, to: auth.to, value: String(auth.value), nonce: nonceHex,
       });
     } catch (e) {
-      return challenge('settlement_unconfirmed', 503);
+      // R20: the facilitator already reported success, so the money may be gone
+      // even though our independent confirmation threw. Refundable, not a 503.
+      return {
+        ok: false, paid: true, refundRequired: true,
+        reason: 'settlement_unconfirmed',
+        payer: auth.from, nonce: nonceHex, amountUsdc: String(auth.value),
+      };
     }
     if (!conf || conf.confirmed !== true) {
       // R81: the facilitator reported success, so funds were collected even
@@ -520,7 +540,13 @@ export async function verifyPayment(env, request, opts = {}) {
     }
     transferConfirmed = true;
   } else {
-    return challenge('settlement_unconfirmed', 503);
+    // R20: settlement succeeded but nothing can confirm it. Funds may be
+    // collected, so this must be refundable rather than a bare 503.
+    return {
+      ok: false, paid: true, refundRequired: true,
+      reason: 'settlement_unconfirmed',
+      payer: auth.from, nonce: nonceHex, amountUsdc: String(auth.value),
+    };
   }
 
   // R41: BIND the receipt to the authorization we actually verified. A settle

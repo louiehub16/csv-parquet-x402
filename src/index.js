@@ -243,8 +243,26 @@ export default {
                 // the same nonce even if this gateway retries the claim.
                 idempotency_key: 'refund:' + v.nonce }),
             });
+            // R20: a bare 2xx is NOT proof the money moved. A misconfigured or
+            // stub refund service that answers 200 without paying would mark the
+            // refund complete PERMANENTLY, suppressing every retry and stranding
+            // the payer's funds. Require an explicit success flag, and accept a
+            // payout reference (tx hash / idempotent replay) as the receipt.
             if (resp.ok) {
+              const rb = await resp.clone().json().catch(() => null);
+              const explicit = rb && (rb.success === true || rb.ok === true ||
+                rb.status === 'refunded' || rb.status === 'success');
+              const isIdemReplay = rb && rb.idempotent === true;
+              const txProof = rb && typeof (rb.txHash || rb.transaction || rb.refund_tx) === 'string'
+                && /^0x[0-9a-fA-F]{64}$/.test(String(rb.txHash || rb.transaction || rb.refund_tx));
+              if (!explicit && !isIdemReplay && !txProof) {
+                console.error('[gateway] refund service returned 2xx without a payout',
+                  'proof for', v.nonce, '— leaving the claim retryable');
+                return false;
+              }
               record.status = 'refunded';
+              record.refundProof = txProof ? String(rb.txHash || rb.transaction || rb.refund_tx)
+                : (isIdemReplay ? 'idempotent_replay' : 'explicit_success');
               await env.SECURITY_KV.put(refKey, JSON.stringify(record),
                 { expirationTtl: 604800 }).catch(() => {});
               try {
@@ -462,9 +480,14 @@ export default {
             return { ok: false, reason: 'nonce_consumption_failed', terminal: false };
           }
           settleAttempted = true;
-          // R91: the verifier already recovered the payer — publish it BEFORE
-          // the facilitator call so any throw can refund the right address.
-          if (info && info.payer) v = Object.assign({}, v, { payer: info.payer });
+          // R20: `info` is { nonce, authorization } and carries NO `payer`
+          // field, so the earlier `info.payer` guard never fired and v.payer
+          // stayed null — a facilitator throw then queued a refund for a null
+          // payer that could repay nobody. Read the signer off the verified
+          // authorization BEFORE calling the facilitator, so any throw refunds
+          // the real address.
+          const authPayer = info && info.authorization && info.authorization.from;
+          if (authPayer) v = Object.assign({}, v, { payer: String(authPayer) });
           const r = await cdpVerifyAndSettle(env, hdrB64,
             'csv-parquet-stream-compressor', tier.microUsdc, tier.microUsdc);
           if (r.ok !== true) {
