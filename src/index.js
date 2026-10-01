@@ -195,8 +195,12 @@ export default {
         }).catch(() => null);
         if (!claim) return false;
         const cj = await claim.json().catch(() => null);
-        if (!cj || cj.ok !== true) return false;      // already claimed/refunded
-        if (cj.alreadyRefunded === true) return true; // another attempt completed it
+        if (!cj || cj.ok !== true) return false;        // DO unreachable
+        // A prior CLAIM is not a completed refund: retry the payout.
+        if (cj.alreadyRefunded === true) return true;
+        if (cj.claimed === false) {
+          // Someone else holds the claim but never finished; try the payout.
+        }
         // R83: the DO claim IS the durable record (it persists the claim in
         // its own storage partition). KV is a convenience mirror only.
         const record = { nonce: v.nonce, payer: v.payer, amountUsdc: tier.microUsdc,
@@ -423,6 +427,8 @@ export default {
           statusNote: 'payment header exceeds 2048-byte limit',
         });
       }
+      // R88: pre-seed v so the catch-all can always refund on a settle throw.
+      v = { nonce: v0Nonce, payer: null, amountUsdc: tier.microUsdc };
       v = await verifyPayment(env, request, {
         expectedAmount: tier.microUsdc,
         sizeBytes: file.size, // R46: price bound to the measured upload
@@ -442,6 +448,9 @@ export default {
             return { ok: false, reason: 'nonce_consumption_failed', terminal: false };
           }
           settleAttempted = true;
+          // R91: the verifier already recovered the payer — publish it BEFORE
+          // the facilitator call so any throw can refund the right address.
+          if (info && info.payer) v = Object.assign({}, v, { payer: info.payer });
           const r = await cdpVerifyAndSettle(env, hdrB64,
             'csv-parquet-stream-compressor', tier.microUsdc, tier.microUsdc);
           if (r.ok !== true) {
@@ -500,8 +509,8 @@ export default {
           const refunded = await recordRefund(v.reason || 'settlement_terminal_failure');
           paymentSettled = true;              // funds were collected
           return json({ error: 'settlement_failed', reason: v.reason,
-            refund: refunded ? 'completed' : 'queued',
-            support: 'quote the nonce for support if the refund is queued' }, 502);
+            refund: refunded ? 'completed' : 'required',
+            support: 'quote the nonce — a durable refund could not be claimed automatically' }, 502);
         }
         releaseReservation();   // R58: nothing paid, release the reservation
         return v.failResponse;
@@ -593,7 +602,7 @@ export default {
           })());
         }
               const refundedU = await recordRefund('upstream_unreachable');
-                return json({ error: 'upstream_unreachable', refund: refundedU ? 'completed' : 'queued' }, 502);
+                return json({ error: 'upstream_unreachable', refund: refundedU ? 'completed' : 'required' }, 502);
             }
       clearTimeout(timeoutId);
       if (request.signal) request.signal.removeEventListener('abort', onAbort);
@@ -622,7 +631,7 @@ export default {
         // details stay in worker logs (observability streams the raw tail).
         const refundedE = await recordRefund('upstream_error');
         return json({ error: 'upstream_error', upstream_status: upstream.status,
-          refund: refundedE ? 'completed' : 'queued' }, 502);
+          refund: refundedE ? 'completed' : 'required' }, 502);
       }
       const text = await upstream.text();
       let parsed;
@@ -647,7 +656,7 @@ export default {
           })());
         }
         const refundedE = await recordRefund('upstream_error');
-        return json({ error: 'upstream_error', upstream_status: upstream.status, refund: refundedE ? 'completed' : 'queued' }, 502);
+        return json({ error: 'upstream_error', upstream_status: upstream.status, refund: refundedE ? 'completed' : 'required' }, 502);
       }
       const ALLOWED = ['status','output_bucket','output_key','rows','skipped_columns','skipped_rows','drift_fallback','duration_s','estimated_cost_usd','warning'];
       const body = {};
@@ -685,6 +694,14 @@ export default {
       // query string IS a bearer credential. Advertise the controlled endpoint.
       if (parsed.download_url) body.download_via = '/v1/compress/result?ref=' + encodeURIComponent(JSON.stringify({
         key: parsed.output_key, bucket: parsed.output_bucket }));
+      // R90: a 2xx carrying a failure status is NOT a delivered conversion.
+      if (parsed && typeof parsed.status === 'string' && parsed.status !== 'success') {
+        const refundedF = await recordRefund('engine_reported_' + parsed.status);
+        const safeStatus = (typeof parsed.status === 'string' && parsed.status.length <= 60
+          && !/(?:AKIA|sk[-_]|secret|token|passwd)/i.test(parsed.status)) ? parsed.status : 'error';
+        return json({ error: 'engine_reported_failure', engine_status: safeStatus,
+          refund: refundedF ? 'completed' : 'required' }, 502);
+      }
       if (v && v.settledTx) body.settled_tx = v.settledTx;
       else if (v && v.settlePending) body.settle_pending = true;
       // OX-ALPHA: settle the gate 8.5 estimate against the engine-reported
