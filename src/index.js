@@ -70,15 +70,23 @@ function parseAuthHeader(hdr) {
   try {
     const dec = JSON.parse(atob(String(hdr || '').replace(/-/g, '+').replace(/_/g, '/')
       + '==='.slice(0, (4 - String(hdr).length % 4) % 4)));
-    const a = dec && dec.payload && dec.payload.authorization;
+    // R34: resolve BOTH envelope depths. A verified gateway envelope stores the
+    // authorization at dec.payload.payload.authorization (see cdp.js R28); some
+    // SDKs emit dec.payload.authorization. Reading only the shallow form made
+    // every valid result lookup fail to parse -- locking payers out of results
+    // they had already paid for.
+    const inner = dec && dec.payload && dec.payload.payload && dec.payload.payload.authorization
+      ? dec.payload.payload
+      : (dec && dec.payload) || null;
+    const a = (inner && inner.authorization) || (dec && dec.payload && dec.payload.authorization);
     if (!a || !a.from || !a.nonce) return null;
-    const s = dec.payload.signature;
+    const s = (inner && inner.signature) || (dec && dec.payload && dec.payload.signature);
     return {
       from: String(a.from),
       nonce: String(a.nonce).replace(/^0x/, '').toLowerCase(),
       to: a.to, value: a.value, validAfter: a.validAfter, validBefore: a.validBefore,
       signature: s || null,
-      domain: dec.payload.domain || (dec.payload && dec.payload.domain) || null,
+      domain: (inner && inner.domain) || (dec && dec.payload && dec.payload.domain) || null,
     };
   } catch (e) { return null; }
 }

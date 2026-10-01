@@ -59,6 +59,14 @@ _BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._\-]{8,}")
 _BARE_SECRET_RE = re.compile(r"\b[A-Za-z0-9/+=]{40}\b")
 
 
+# R34: The response for an internal failure must never carry exception text.
+# mask_secret() keeps the first and last four characters of anything >= 12 chars,
+# and redaction only strips UNLABELED 40-char secrets -- so a shorter credential
+# (access key id, token, password) passed through and 8 of its characters were
+# published in the HTTP body. Client-facing text is now a fixed generic string.
+GENERIC_INTERNAL_ERROR = "Internal conversion error."
+
+
 def redact_message(err) -> str:
     """Redact endpoint URLs, access-key ids, and generic credential material
     from an exception/message so the result is safe to embed in a (masked) HTTP
@@ -646,19 +654,22 @@ async def compress(file: UploadFile, target_destination: str = Form(None)):
                 # generic 500 would lose the real cause. Surface the masked
                 # original error instead.
                 if frozen_schema is None and first_error is not None:
+                    # R34: the detail goes to the redacted internal log only.
+                    log_diagnostic("pre_parse_failure", first_error)
                     return JSONResponse(status_code=500, content={
                         "status": "error",
-                        "message": mask_secret(redact_message(first_error))})
+                        "message": GENERIC_INTERNAL_ERROR})
                 raise
 
         if res is None:
             if in_fallback and frozen_schema is None and first_error is not None:
-                # Fallback parsed no rows AND the first pass failed pre-parse,
-                # so the real cause is the first pass's error — surface it
-                # masked instead of a generic 'no rows' message.
+                # Fallback parsed no rows AND the first pass failed pre-parse.
+                # R34: log the redacted cause internally, return a generic
+                # message -- exception text in a response body is a leak channel.
+                log_diagnostic("pre_parse_no_rows", first_error)
                 return JSONResponse(status_code=500, content={
                     "status": "error",
-                    "message": mask_secret(redact_message(first_error))})
+                    "message": GENERIC_INTERNAL_ERROR})
             return JSONResponse(status_code=400, content={
                 "status": "error", "message": "No parseable CSV rows found."})
         rows, _chunks, pass_skipped, pass_invalid = res
