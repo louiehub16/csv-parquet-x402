@@ -343,6 +343,8 @@ export async function cdpVerifyAndSettle(env, paymentHeaderB64, resourceName, mi
       // cannot fall back and re-serve the same authorization.
       if (isPermanentRejection(settleRes.status, sErr)) {
         return {
+          // Facilitator gave a definitive payment verdict, so nothing settled.
+          definitelyNotSubmitted: true,
           mode: 'cdp', ok: false, retryable: false,
           reason: safeReason(sErr, `settle_http_${settleRes.status}`),
         };
@@ -364,10 +366,11 @@ export async function cdpVerifyAndSettle(env, paymentHeaderB64, resourceName, mi
       return { mode: 'cdp', ok: false, retryable: false, settledUnknown: true, reason: 'settle_unconfirmed' };
     }
 
-    const payer = (payload.from && typeof payload.from === 'string')
-      ? payload.from.toLowerCase()
-      : (payload.authorization && payload.authorization.from
-        ? String(payload.authorization.from).toLowerCase() : null);
+    // Payer may appear at the envelope root or inside the authorization.
+    const payer = (payload.authorization && payload.authorization.from)
+      ? String(payload.authorization.from).toLowerCase()
+      : (payload.from && typeof payload.from === 'string'
+        ? payload.from.toLowerCase() : null);
 
     // R17: a success flag WITHOUT a transaction identifier is unprovable
     // settlement. Require a real tx hash — the caller records it as the
@@ -384,6 +387,16 @@ export async function cdpVerifyAndSettle(env, paymentHeaderB64, resourceName, mi
       settledTx,
       amountMicroUsdc: rawAmount, // canonical integer string — safe for BigInt()
       payer,
+      // R41: echo the settled identity so the caller can bind the receipt to
+      // the authorization it verified (payer/recipient/amount/nonce).
+      // Prefer what the facilitator actually reported settled; fall back to the
+      // authorization when the response omits it.
+      settledFrom: (sData.payer || sData.from || payer) || null,
+      settledTo: sData.payTo || sData.to || (payload.authorization && payload.authorization.to) || reqObj.payTo || null,
+      settledAmountUsdc: (sData.amount != null ? String(sData.amount) : rawAmount) || null,
+      settledNonce: sData.nonce || (payload.authorization && payload.authorization.nonce) || null,
+      // We DID submit to the facilitator, so this is never 'definitely not submitted'.
+      definitelyNotSubmitted: false,
     };
   } catch (e) {
     // Ambiguous settlement state (transport error / unparsed body). The

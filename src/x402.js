@@ -116,6 +116,10 @@ const bytesToHex = (b) => [...b].map((x) => x.toString(16).padStart(2, '0')).joi
 export function tierForBytes(sizeBytes) {
   const b = Number(sizeBytes);
   if (!Number.isFinite(b) || b < 0) throw new RangeError('size must be a non-negative number');
+  // R37: values above 2^53 lose byte precision when coerced through Number,
+  // which would undercharge an oversized upload. Reject rather than price
+  // something we cannot count exactly.
+  if (!Number.isSafeInteger(b)) throw new RangeError('size exceeds exact integer range');
   const mk = (microUsdc, storage, requiresUserDest) =>
     ({ microUsdc, usd: (microUsdc / 1e6).toFixed(4), storage, requiresUserDest });
   if (b < 100 * MB) return mk(10000, 'internal_r2', false);                    // flat $0.01
@@ -134,6 +138,17 @@ export function tierForBytes(sizeBytes) {
 
 // ---------------------------------------------------------------- challenge
 // Standards-shaped x402 v2 manifest; base64url in the PAYMENT-REQUIRED header.
+
+// UTF-8 SAFE base64url: btoa() throws on code points > 0xFF (e.g. a Unicode
+// description), which would surface as an unhandled 500 instead of a priced 402.
+function b64urlUtf8(obj) {
+  const bytes = new TextEncoder().encode(JSON.stringify(obj));
+  let bin = '';
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+
 export function buildChallenge({ url, description, microUsdc, maxTimeoutSeconds = 600, payTo, statusNote, status = 402 }) {
   const manifest = {
     x402Version: 2,
@@ -149,7 +164,7 @@ export function buildChallenge({ url, description, microUsdc, maxTimeoutSeconds 
       extra: { name: 'USD Coin', version: '2' },
     }],
   };
-  const b64 = btoa(JSON.stringify(manifest)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const b64 = b64urlUtf8(manifest);
   const body = { error: 'payment_required', amount_usdc: Number(microUsdc) / 1e6, network: NETWORK, asset: USDC_ON_BASE, payTo };
   if (statusNote) body.note = statusNote;
   return new Response(JSON.stringify(body), {
@@ -217,7 +232,26 @@ export function pubkeyToAddress(x, y) {
 // expectedAmount: the price comes ONLY from opts.expectedAmount passed by
 // the gateway's tier computation. There is NO header fallback (R24 security
 // fix: client-controlled price headers are never trusted).
+// R42: release a claimed nonce when settlement definitively fails, so the
+// payer can retry with the same authorization instead of being locked out.
+async function releaseNonceClaim(env, nonce) {
+  try {
+    const store = env && env.CONSUMED_TX_STORE;
+    if (!store || !nonce) return;
+    const stub = store.get(store.idFromName('singleton'));
+    await stub.fetch('https://internal/release-nonce', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ nonce }),
+    });
+  } catch (e) { /* best-effort: the client may still retry with a fresh auth */ }
+}
+
 export async function verifyPayment(env, request, opts = {}) {
+  // R40: opts.settle — REQUIRED async (paymentPayload) => result. Verification
+  // is not payment: this function only returns ok:true when a settlement
+  // function proves the transfer. Callers must not treat a bare signature
+  // check as a completed payment.
   const payTo = env && env.MERCHANT_WALLET_ADDRESS;
   // R24 security fix: NEVER trust a client-supplied price header. The price
   // comes only from the gateway's own tier computation (opts.expectedAmount).
@@ -243,6 +277,16 @@ export async function verifyPayment(env, request, opts = {}) {
   if (!expected || !/^[0-9]+$/.test(expected) || expected === '0') {
     return challenge('unpriceable_request');
   }
+  // R46: the measured size is MANDATORY. Without it, expectedAmount is the
+  // client's own number and a 1-micro-USDC authorization would pass.
+  if (opts.sizeBytes == null) return challenge('unpriceable_request');
+  let authoritative;
+  try {
+    authoritative = tierForBytes(opts.sizeBytes).microUsdc;
+  } catch (e) {
+    return challenge('unpriceable_request');
+  }
+  if (String(authoritative) !== String(expected)) return challenge('price_mismatch', 400);
 
   const header = request.headers.get('PAYMENT-SIGNATURE') || request.headers.get('X-PAYMENT');
   if (!header) return challenge('payment_signature_header_missing');
@@ -303,7 +347,9 @@ export async function verifyPayment(env, request, opts = {}) {
   // commitment (maxTimeoutSeconds:600) plus a small dispatch margin — an
   // authorization valid for weeks must never pass, since we can only settle
   // within the advertised window.
-  if (!Number.isInteger(vb - va) || vb - va > 600 + 300) return challenge('time_window_violation');
+  // R38: the challenge advertises maxTimeoutSeconds=600, so an
+  // authorization window longer than that contradicts our own manifest.
+  if (!Number.isInteger(vb - va) || vb - va > 600) return challenge('time_window_violation');
   // STRICT window check with NO early acceptance: dispatch happens only once
   // the EIP-3009 authorization is actually spendable (now >= validAfter) —
   // benign client clock skew is no reason to take payment we cannot yet
@@ -370,17 +416,27 @@ export async function verifyPayment(env, request, opts = {}) {
   // SECURITY_KV-only deployment cannot make claim+consume atomic, so two
   // concurrent requests can both pass the check and both receive paid
   // service. Fail closed instead of serving with a non-atomic guard.
-  if (!env.CONSUMED_TX_STORE) {
+  if (!env || !env.CONSUMED_TX_STORE) {
     return challenge('replay_store_unavailable', 503);
   }
   {
     try {
-      // R25: ATOMIC PRE-DISPATCH CLAIM via DO reserve-nonce — eliminates the
+      // R47: validate the settlement wiring BEFORE reserving the nonce, so a
+  // misconfigured caller cannot burn a valid authorization.
+  if (typeof opts.settle !== 'function' || typeof opts.confirm !== 'function') {
+    return challenge('settlement_unavailable', 503);
+  }
+
+  // R25: ATOMIC PRE-DISPATCH CLAIM via DO reserve-nonce — eliminates the
       // double-delivery TOCTOU (two concurrent same-nonce requests both passed a
       // read-only check). On upstream failure the gateway releases the claim via
       // /release-nonce so failed jobs don't burn valid nonces.
-      const id = env.CONSUMED_TX_STORE.idFromName('singleton');
-      const stub = env.CONSUMED_TX_STORE.get(id);
+      // R39: optional chaining — a missing/undefined env must fail closed with
+      // the same challenge, not throw a TypeError into the generic 500 path.
+      const store = env && env.CONSUMED_TX_STORE;
+      if (!store) return challenge('replay_store_unavailable', 503);
+      const id = store.idFromName('singleton');
+      const stub = store.get(id);
       const nres = await stub.fetch('https://internal/reserve-nonce', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -397,10 +453,96 @@ export async function verifyPayment(env, request, opts = {}) {
     }
   }
 
+  // R40: settle BEFORE declaring success. A valid signature is an unexecuted
+  // promise to pay; only a confirmed settlement is payment.
+  if (typeof opts.settle !== 'function') {
+    return challenge('settlement_unavailable', 503);
+  }
+  let settlement;
+  try {
+    settlement = await opts.settle(payment);
+  } catch (e) {
+    // R44: a transport error here is AMBIGUOUS (the transfer may have landed),
+    // so KEEP the claim — releasing invites a double-delivery race against a
+    // late settlement. The client must present a FRESH authorization.
+    return challenge('settlement_failed', 502);
+  }
+  if (!settlement || settlement.ok !== true || typeof settlement.settledTx !== 'string' ||
+      !/^0x[0-9a-fA-F]{64}$/.test(settlement.settledTx)) {
+    // Not settled, or settled without a provable transaction hash. The claim is
+    // released ONLY when the settler explicitly guarantees nothing was
+    // submitted; otherwise the transfer may still broadcast and retaining the
+    // claim is what prevents one payment from buying two deliveries.
+    if (settlement && settlement.definitelyNotSubmitted === true) {
+      await releaseNonceClaim(env, nonceHex);
+    }
+    return challenge('settlement_unconfirmed', 503);
+  }
+  // R48: once a transfer is CONFIRMED on-chain, the claim is permanent. A
+  // metadata mismatch afterwards must NOT release it, or the same (already
+  // paid) authorization could be replayed for a second delivery.
+  let transferConfirmed = false;
+
+  // R45: require ON-CHAIN CONFIRMATION of the settlement. The callback's own
+  // claim is not proof; `opts.confirm(txHash)` must independently confirm the
+  // Base transfer (status 1 + matching USDC Transfer) before we treat the
+  // payment as collected. No confirm function => not proven.
+  if (typeof opts.confirm === 'function') {
+    let conf;
+    try {
+      conf = await opts.confirm(settlement.settledTx, {
+        from: auth.from, to: auth.to, value: String(auth.value), nonce: nonceHex,
+      });
+    } catch (e) {
+      return challenge('settlement_unconfirmed', 503);
+    }
+    if (!conf || conf.confirmed !== true) {
+      return challenge('settlement_unconfirmed', 503);
+    }
+    transferConfirmed = true;
+  } else {
+    return challenge('settlement_unconfirmed', 503);
+  }
+
+  // R41: BIND the receipt to the authorization we actually verified. A settle
+  // implementation that returns ok with an unrelated transaction hash must not
+  // unlock paid work, so the callback must echo the exact payer/recipient/
+  // amount/nonce it settled. Any mismatch is a failed proof.
+  {
+    const s = settlement;
+    const lower = (a) => String(a).toLowerCase();
+    const strip0x = (a) => String(a).replace(/^0x/i, '').toLowerCase();
+    // Every identity field is REQUIRED: an implementation that omits them
+    // cannot be bound to the authorization, so the proof is incomplete.
+    if (s.settledFrom == null || s.settledTo == null ||
+        s.settledAmountUsdc == null || s.settledNonce == null) {
+      // R49: release ONLY when the settler explicitly guarantees nothing was
+      // submitted on-chain. A missing/garbled result is AMBIGUOUS (the transfer
+      // may still broadcast), so retain the claim and require a fresh
+      // authorization instead of risking a second delivery for one payment.
+      if (!transferConfirmed && s.definitelyNotSubmitted === true) {
+        await releaseNonceClaim(env, nonceHex);
+      }
+      return challenge('settlement_proof_incomplete', 503);
+    }
+    if (lower(s.settledFrom) !== lower(auth.from) ||
+        lower(s.settledTo) !== lower(auth.to) ||
+        lower(s.settledAmountUsdc) !== String(auth.value).toLowerCase() ||
+        strip0x(s.settledNonce) !== strip0x(nonceHex)) {
+      // A confirmed mismatch IS definitive (the settled transfer demonstrably
+      // belongs to a different authorization) — but an UNconfirmed one is not.
+      if (!transferConfirmed && s.definitelyNotSubmitted === true) {
+        await releaseNonceClaim(env, nonceHex);
+      }
+      return challenge('settlement_mismatch', 503);
+    }
+  }
+
   return {
     ok: true,
+    settledTx: settlement.settledTx,
     payer: auth.from,
-    amountMicro: Number(auth.value),
+    amountMicroUsdc: String(auth.value), // string: micro-USDC beyond 2^53 loses precision as a Number
     nonce: nonceHex,
     validBefore: Number(auth.validBefore),
     // R33: hand the caller the VERIFIED authorization and the raw envelope so
@@ -412,12 +554,6 @@ export async function verifyPayment(env, request, opts = {}) {
       nonce: nonceHex,
     },
     paymentPayload: payment,
-    // R36: settlement is NOT the verifier's job and is deliberately not done
-    // here — the gateway MUST route this payload through cdp.js
-    // (cdpVerifyAndSettle) and refuse to dispatch unless a transaction hash is
-    // returned. verified:false is a machine-readable reminder that an offline
-    // signature check alone never constitutes payment.
-    verified: false,
   };
 }
 
@@ -429,57 +565,27 @@ export async function verifyPayment(env, request, opts = {}) {
 // surface it; silently swallowing would hide replayable payments.
 // R16: ATOMIC nonce consumption via the authoritative DO store (strongly
 // consistent). Throws on any failure — the caller must fail closed.
-export async function consumeNonce(env, nonce, validBeforeSeconds) {
-  // R27: On the DO path the nonce was ALREADY atomically reserved in
-  // verifyPayment() via /reserve-nonce. That claim IS permanent
-  // consumption — calling /reserve-nonce again would see already:'used'
-  // and throw. This function now only handles the KV fallback path.
-  if (!env || !env.CONSUMED_TX_STORE) {
-    if (env && env.SECURITY_KV && nonce) {
-      // KV-only deployment: write the consumed marker, then report SUCCESS.
-      // (R30: a successful put that then throws made callers treat a completed
-      // consumption as a replay-store outage.)
-      // R33: hold the marker until the authorization could no longer settle,
-      // so the entry never expires while the payment is still collectible.
-      const nowS = Math.floor(Date.now() / 1000);
-      const vb = Number(validBeforeSeconds);
-      const ttl = Number.isFinite(vb) && vb > 0
-        ? Math.max(86400, Math.ceil(vb - nowS) + 3600)
-        : 86400;
-      await env.SECURITY_KV.put('x402_nonce:' + String(nonce).toLowerCase(), '1',
-        { expirationTtl: ttl });
-      return true;
-    }
-    throw new Error('replay_store_unavailable');
-  }
-  // DO path: the reservation made at verification time is now FINALIZED —
-  // successful delivery burns the nonce permanently. If the reservation had
-  // been released on an upstream failure, this returns 409 and the caller
-  // treats it as a lost race (fail closed) rather than serving free work.
-  {
-    const id = env.CONSUMED_TX_STORE.idFromName('singleton');
-    const stub = env.CONSUMED_TX_STORE.get(id);
-    const res = await stub.fetch('https://internal/finalize-nonce', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ nonce }),
-    }).catch(() => { throw new Error('replay_store_unavailable'); });
-    const data = await res.json().catch(() => null);
-    if (!res.ok || !data || data.ok !== true) throw new Error('nonce_finalize_failed');
-    return true;
-  }
+export async function consumeNonce(env, nonce) {
+  // R37: DO-ONLY finalization. The SECURITY_KV fallback is gone — KV is
+  // eventually consistent and cannot atomically reserve a nonce, so consuming
+  // through it would permit concurrent double-delivery. If the DO is missing
+  // the caller must fail closed.
+  if (!env || !env.CONSUMED_TX_STORE) throw new Error('replay_store_unavailable');
+  const id = env.CONSUMED_TX_STORE.idFromName('singleton');
+  const stub = env.CONSUMED_TX_STORE.get(id);
+  const res = await stub.fetch('https://internal/finalize-nonce', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ nonce }),
+  }).catch(() => { throw new Error('replay_store_unavailable'); });
+  const data = await res.json().catch(() => null);
+  if (!res.ok || !data || data.ok !== true) throw new Error('nonce_finalize_failed');
+  return true;
 }
 
-export async function markNonceUsed(env, nonce, validBeforeSeconds) {
-  if (!env || !env.SECURITY_KV || !nonce) throw new Error('kv_unavailable');
-  const vbSec = Number(validBeforeSeconds);
-  const ttl = Math.max(86400, Number.isFinite(vbSec) ? (vbSec - Math.floor(Date.now() / 1000)) + 3600 : 86400);
-  try {
-    await env.SECURITY_KV.put('x402_nonce:' + String(nonce).toLowerCase(), '1', { expirationTtl: ttl });
-  } catch (e) {
-    throw new Error('kv_unavailable');
-  }
-}
+// markNonceUsed — REMOVED (R37): the non-atomic KV replay fallback is gone; the
+// Durable Object is the only replay store and the gateway fails closed without it.
+
 
 // CPU economics for the gateway's ceiling/deficit gates (mirrors SpendGuard's
 // estimator contract): ~2 GB/min throughput at SG_CPU_RATE_PER_HR ($/hour).
