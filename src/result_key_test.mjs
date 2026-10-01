@@ -65,5 +65,5 @@ for (const f of fails) console.log('FAIL:', f);
 console.log(fails.length
   ? `RESULT-KEY-FAIL (${fails.length})`
   : `RESULT-KEY-ALL-PASS ('${sample}' -> stored '${real}' -> returned unchanged; ` +
-    `no re-sanitization, no double suffix)`);
+    `sanitize applied ONCE at ingest, never again at retrieval)`);
 process.exit(fails.length ? 1 : 0);
