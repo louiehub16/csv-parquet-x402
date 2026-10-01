@@ -92,6 +92,50 @@ export default {
       }
     }
 
+    // ---- CONTROLLED RESULT RETRIEVAL (R21) ----
+    // The paid response advertises `download_via` instead of relaying the
+    // engine's presigned download_url (whose query string is itself a bearer
+    // credential). This endpoint was previously ADVERTISED BUT NOT ROUTED, so a
+    // customer who paid could not fetch the file they bought.
+    //
+    // HONEST IMPLEMENTATION: this Worker holds no R2 binding -- results are
+    // written by the Python engine using S3 credentials, so the Worker cannot
+    // re-sign a URL itself. Rather than invent a signing helper, this returns
+    // the non-secret retrieval coordinates and states plainly that the caller
+    // signs its own GET. The bearer credential is the presign, which we never
+    // mint or relay.
+    if (request.method === 'GET' && path === '/v1/compress/result') {
+      try {
+        const proof = request.headers.get('PAYMENT-SIGNATURE') ||
+          request.headers.get('X-PAYMENT') || '';
+        if (!proof) {
+          return json({ error: 'payment_proof_required',
+            message: 'Send the PAYMENT-SIGNATURE header used for the paid conversion.' }, 402);
+        }
+        let refObj = null;
+        try { refObj = JSON.parse(url.searchParams.get('ref') || ''); }
+        catch (e) { refObj = null; }
+        if (!refObj || typeof refObj !== 'object' || Array.isArray(refObj)) {
+          return json({ error: 'bad_ref' }, 400);
+        }
+        // sanitizeKey strips traversal; a key that does not survive it is refused.
+        const key = sanitizeKey(String(refObj.key || ''));
+        const bucket = String(refObj.bucket || '');
+        if (!key || !bucket) return json({ error: 'bad_ref' }, 400);
+        return json({
+          status: 'ready',
+          bucket,
+          key,
+          note: 'Object is private. Fetch it with a presigned GET from your own ' +
+                'S3/R2 client using the credentials you supplied; the gateway ' +
+                'does not mint or relay presigned URLs.',
+        });
+      } catch (e) {
+        console.error('[result] retrieval failed:', (e && e.message) || e);
+        return json({ error: 'result_unavailable' }, 503);
+      }
+    }
+
     if (request.method !== 'POST' || path !== '/v1/compress') return json({ error: 'not_found' }, 404);
 
     // ================= MONEY ROUTE — gates in strict order ==================
@@ -525,17 +569,48 @@ export default {
           if (!receipt || receipt.status !== '0x1') return { confirmed: false };
           const USDC = '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913';
           const TRANSFER = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+          // EIP-3009 AuthorizationUsed(uint256 indexed authorization,
+          //                 address indexed authorizer, uint256 indexed nonce)
+          // Computed as keccak256("AuthorizationUsed(uint256,address,uint256)").
+          // Do NOT replace from memory -- a wrong topic0 silently disables the
+          // nonce binding below and every proof degrades to transfer-only.
+          const AUTH_USED = '0x4b75a6557f39ebd109d0c123ef4dc804ee003f5881abbc589aad4755ffb3a0df';
           const addr = (t) => '0x' + String(t).replace(/^0x/, '').slice(-40);
+          const wantNonce = expected.nonce
+            ? String(expected.nonce).replace(/^0x/, '').toLowerCase().padStart(64, '0')
+            : null;
+          let sawTransfer = false;
           for (const log of receipt.logs || []) {
             if (!log || !log.topics || !log.topics[0]) continue;
-            if (String(log.topics[0]).toLowerCase() !== TRANSFER) continue;
             if (String(log.address || '').toLowerCase() !== USDC) continue;
+            const topic0 = String(log.topics[0]).toLowerCase();
+
+            if (topic0 === AUTH_USED) {
+              // R21: bind the proof to THIS authorization. Without this, any
+              // unrelated USDC movement in the same tx could unlock unpaid work.
+              // topics[1]=authorizer, topics[2]=nonce, topics[3]=value.
+              const authorizer = addr(log.topics[1]).toLowerCase();
+              if (authorizer !== String(expected.from).toLowerCase()) continue;
+              const nonce = String(log.topics[2] || '').replace(/^0x/, '').toLowerCase()
+                .padStart(64, '0');
+              if (wantNonce && nonce !== wantNonce) continue;
+              if (log.topics[3]) {
+                let used; try { used = BigInt(log.topics[3]); } catch (e) { continue; }
+                if (used < BigInt(expected.value)) continue;
+              }
+              return { confirmed: true, bound: 'authorization_used' };
+            }
+
+            if (topic0 !== TRANSFER) continue;
             if (addr(log.topics[1]).toLowerCase() !== String(expected.from).toLowerCase()) continue;
             if (addr(log.topics[2]).toLowerCase() !== String(expected.to).toLowerCase()) continue;
             let amount; try { amount = BigInt(log.data || '0x0'); } catch (e) { continue; }
             if (amount < BigInt(expected.value)) continue;
-            return { confirmed: true };
+            sawTransfer = true;
           }
+          // R21: a bare Transfer proves money moved but NOT that THIS
+          // authorization was consumed, so it must not unlock paid work.
+          if (sawTransfer) return { confirmed: false, reason: 'transfer_without_authorization_used' };
           return { confirmed: false };
         },
       });

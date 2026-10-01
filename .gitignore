@@ -5,7 +5,18 @@ __pycache__/
 review/
 _staging/
 node_modules/
+# R21: was `*.mjs`, which excluded ALL 8 test suites (selftest, e2e,
+# gw_smoke, sign_selftest, integration, refund_claim) plus mint_vector from
+# git. A fresh clone shipped the gateway with NO regression gate. Keep
+# ignoring ad-hoc scratch scripts only; the suites are tracked explicitly.
 *.mjs
+!src/selftest.mjs
+!src/e2e_test.mjs
+!src/gw_smoke.mjs
+!src/sign_selftest.mjs
+!src/integration_test.mjs
+!src/refund_claim_test.mjs
+!src/mint_vector.mjs
 x402_wallet_project.json
 .openrouter_key*
 RESUME_REVIEW.bat
