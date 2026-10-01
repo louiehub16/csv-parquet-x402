@@ -341,16 +341,26 @@ def _assert_resolved_public(host: str) -> str:
 def _job_id_from_filename(filename):
     """Extract the gateway's per-job prefix from an inbound filename.
 
-    src/index.js (R44) rewrites the outbound upload name to
-    "<16-hex job id>-<original stem><ext>", derived from the paid authorization
-    nonce. That prefix is the ONLY thing distinguishing two concurrent jobs that
-    picked the same output path, so it must be recovered here and used to
-    namespace the key. Returns '' if the name does not carry one.
+    src/index.js rewrites the outbound upload name to
+    "<job id>-<original stem><ext>". R44 derived that id from the paid
+    authorization nonce; R55 replaced it with a GATEWAY-GENERATED 128-bit id
+    (crypto.randomUUID() with dashes stripped = 32 hex characters), because a
+    payer-controlled 64-bit nonce prefix could collide across jobs.
+
+    That prefix is the ONLY thing distinguishing two concurrent jobs that picked
+    the same output path, so it must be recovered here and used to namespace the
+    key. Accepts both the current 32-hex form and the legacy 16-hex one.
+    Returns '' if the name carries no recognizable prefix.
     """
     stem = str(filename or "").replace("\\", "/").split("/")[-1]
-    head = stem.split("-", 1)[0]
-    if len(head) == 16 and all(c in "0123456789abcdef" for c in head.lower()):
-        return head.lower()
+    head = stem.split("-", 1)[0].lower()
+    # R57: the gateway emits a GATEWAY-GENERATED 128-bit id -- 32 hex chars
+    # (crypto.randomUUID() with dashes stripped). Accepting only 16 silently
+    # dropped the prefix for every BYO job, so concurrent conversions could
+    # overwrite the same caller-supplied object and serve another customer's
+    # data. Accept the full 32-hex form (and keep 16 for any older caller).
+    if head and len(head) in (16, 32) and all(c in "0123456789abcdef" for c in head):
+        return head
     return ""
 
 

@@ -14,6 +14,7 @@ import sys
 import types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+REPO_SRC = os.path.dirname(HERE)
 
 
 def _load():
@@ -65,6 +66,24 @@ def main():
 
     # --- the helper recovers the gateway's job prefix ---------------------
     extract = ns["_job_id_from_filename"]
+    # R57: the gateway emits crypto.randomUUID() with dashes stripped = 32 hex
+    # chars. The extractor MUST accept that exact width; a mismatch silently
+    # drops the per-job prefix and lets concurrent BYO jobs overwrite each other.
+    import re as _re
+    gw = open(os.path.join(REPO_SRC, "src", "index.js"), encoding="utf-8").read()
+    m = _re.search(r"jobStem\s*=\s*crypto\.randomUUID\(\)\.replace\(([^)]*)\)", gw)
+    ok("the gateway emits a randomUUID-derived stem", m is not None, "no randomUUID stem")
+    if m:
+        dashes_removed = "-" in m.group(1)
+        ok("the gateway strips the UUID dashes (so the stem is 32 hex chars)",
+           dashes_removed, m.group(1))
+        ok("the extractor accepts 32 hex chars",
+           extract("ab" * 16 + "-data.csv") == "ab" * 16,
+           extract("ab" * 16 + "-data.csv"))
+        ok("the extractor still accepts the legacy 16-hex form",
+           extract("ab" * 8 + "-data.csv") == "ab" * 8,
+           extract("ab" * 8 + "-data.csv"))
+
     ok("a 16-hex prefix is recovered",
        extract("abababababababab-data.csv") == "abababababababab",
        extract("abababababababab-data.csv"))
