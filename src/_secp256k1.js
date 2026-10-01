@@ -125,10 +125,21 @@ export function recover(msgHash, rBytes, sBytes, recId) {
   // Low-s enforcement: USDC/OpenZeppelin ECDSA rejects high-s; local recovery
   // must match contract behavior or work is uncollectible.
   if (s > N / 2n) throw new RangeError('high-s signature (malleable) rejected');
-  if (recId !== 0 && recId !== 1)
-    throw new RangeError('recId must be 0 or 1');
+  // R43: accept the full 0..3 recovery-id range. ids 2/3 arise when the curve
+  // point R has x >= n (r is defined mod n, so r + n is the true x). The
+  // probability is ~2^-128, but rejecting them makes recovery fail for a
+  // mathematically valid signature rather than returning the wrong key, so the
+  // candidate x is selected explicitly below.
+  if (![0, 1, 2, 3].includes(recId))
+    throw new RangeError('recId must be 0, 1, 2 or 3');
+  const overflowed = recId >= 2;
+  const parity = recId & 1;
 
-  const R = decompressY(r, recId);
+  // R43: when the point R has x >= n, r alone is not the true x -- the real
+  // coordinate is r + n, which ids 2/3 encode. decompressY() takes the x value
+  // and the y-parity, so select the correct candidate explicitly.
+  const Rx = overflowed ? r + N : r;
+  const R = decompressY(Rx, parity);
   const z = bytesToBigInt(msgHash);
   const rInv = modInv(r, N);
   const u1 = mod(-z * rInv, N);

@@ -394,8 +394,11 @@ export async function verifyPayment(env, request, opts = {}) {
       if (sBi > HALF) throw new RangeError('high-s signature');
     }
     let recId;
+    // R43: accept the full recovery-id range. v may arrive as 0/1 or 27/28, and
+    // the 2/3 (x >= n) forms are mathematically valid -- rejecting them failed
+    // recovery for a valid signature instead of returning a wrong key.
     if (vRaw === 27 || vRaw === 28) recId = vRaw - 27;
-    else if (vRaw === 0 || vRaw === 1) recId = vRaw;
+    else if (vRaw >= 0 && vRaw <= 3) recId = vRaw;
     else throw new RangeError('bad v');
     const rB = new Uint8Array(32); for (let i = 0; i < 32; i++) rB[i] = parseInt(rHex.slice(i * 2, i * 2 + 2), 16);
     const sB = new Uint8Array(32); for (let i = 0; i < 32; i++) sB[i] = parseInt(sHex.slice(i * 2, i * 2 + 2), 16);
