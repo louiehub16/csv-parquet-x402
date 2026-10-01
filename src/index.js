@@ -506,6 +506,32 @@ export default {
           return json({ error: 'no_delimiters_detected' }, 400);
       }
 
+      // (5.1) FULL-BODY BINARY SCAN (R45) — the sniff above deliberately reads
+      // only the first 1 MB to stay cheap, and the engine re-checks only that
+      // same prefix. A NUL byte or embedded archive magic PAST that boundary
+      // therefore reached paid processing. The whole body is already buffered
+      // in memory (formData()), so scan all of it before payment: the cost is a
+      // single pass over bytes we already hold.
+      {
+        const all = new Uint8Array(await file.arrayBuffer());
+        if (all.length > 0) {
+          let nul = false;
+          for (let i = 0; i < all.length; i++) {
+            if (all[i] === 0x00) { nul = true; break; }
+          }
+          if (nul) return json({ error: 'null_byte_detected' }, 400);
+          // Embedded archive/PDF magic anywhere in the body, not just at byte 0.
+          for (let i = 0; i + 1 < all.length; i++) {
+            if ((all[i] === 0x50 && all[i + 1] === 0x4b) ||           // PK (zip)
+                (all[i] === 0x1f && all[i + 1] === 0x8b) ||           // gzip
+                (all[i] === 0x25 && all[i + 1] === 0x50 &&
+                 all[i + 2] === 0x44 && all[i + 3] === 0x46)) {       // %PDF
+              return json({ error: 'archive_or_binary_detected' }, 400);
+            }
+          }
+        }
+      }
+
       // (5.5) OUTPUT SANITIZATION — sanitize BOTH the stored filename and any
       //       BYO target_destination BEFORE anything downstream sees them.
       const safeName = sanitizeKey(file.name);
