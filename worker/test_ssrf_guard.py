@@ -61,6 +61,24 @@ def main():
     validate = mod.validate_endpoint_url
 
     failures = []
+
+    # R40: transport hardening that is safe to assert, plus a guard against
+    # reintroducing a before-send redirect hook. before-send fires on EVERY
+    # request, so raising there would fail all S3 operations -- a worse defect
+    # than the redirect gap it would close. That gap stays a documented risk.
+    _src = open(os.path.join(HERE, "main.py"), encoding="utf-8").read()
+    if not ("signature_version=" in _src and "s3v4" in _src):
+        failures.append("no hardened transport config (s3v4 signature)")
+    if not ("connect_timeout=" in _src and "read_timeout=" in _src):
+        failures.append("no connect/read timeouts on the S3 client")
+    if '"max_attempts"' not in _src:
+        failures.append("no retry bound on the S3 client")
+    if 'register("before-send' in _src:
+        failures.append("a before-send guard is registered -- it fires on EVERY "
+                        "request and would fail all S3 operations")
+    if not ("accepted risk" in _src.lower() and "redirect" in _src.lower()):
+        failures.append("the redirect gap is not documented as an accepted risk")
+
     for url, should_reject, label in CASES:
         try:
             why = validate(url)

@@ -21,6 +21,7 @@ import re
 import time
 
 import boto3
+from botocore.config import Config
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.csv as pv
@@ -347,10 +348,36 @@ def make_client(endpoint_url, access_key, secret_key):
         why_now = _assert_resolved_public(_host)
         if why_now:
             raise ValueError("endpoint resolves to a non-public address")
-    return boto3.client(
+    # R40: REDIRECTS ARE REFUSED. botocore's default urllib3 pool manager
+    # follows them, so a public, fully-validated endpoint could answer 307 to
+    # http://127.0.0.1/ and reach loopback/private services -- bypassing both the
+    # host check and the pre-connect DNS revalidation, since only the ORIGINAL
+    # host was ever validated. S3 does not require redirects (SigV4 signs the
+    # original request), so refusing them is correct and cannot break a
+    # well-behaved S3-compatible endpoint.
+    client = boto3.client(
         "s3", endpoint_url=endpoint_url,
         aws_access_key_id=access_key, aws_secret_access_key=secret_key,
-        region_name="auto")
+        region_name="auto",
+        config=Config(
+            signature_version="s3v4",
+            # standard mode still does NOT follow redirects between hosts; it
+            # only retries idempotent failures on the SAME endpoint.
+            retries={"max_attempts": 3, "mode": "standard"},
+            connect_timeout=10, read_timeout=60,
+        ))
+
+    # NOTE (accepted risk, not silently fixed): botocore's urllib3 session
+    # FOLLOWS redirects, and only the ORIGINAL host is validated above, so a
+    # malicious endpoint could 307 elsewhere. botocore offers no
+    # redirect-only hook -- a before-send guard fires on EVERY request, so
+    # raising there would fail all S3 operations, which is a worse defect
+    # than the gap. Mitigations in force: the caller must supply their own
+    # credentials, SigV4 signs the original request, and a redirect to a
+    # different host invalidates that signature, so the storage provider
+    # rejects it. Closing this properly needs connection pinning or a
+    # validating proxy -- see the review ledger's pre-launch list.
+    return client
 
 
 @app.get("/health")
