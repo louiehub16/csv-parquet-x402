@@ -188,9 +188,13 @@ export default {
         }
         const dId = env.CONSUMED_TX_STORE.idFromName('singleton');
         const dStub = env.CONSUMED_TX_STORE.get(dId);
-        // R18: a stable per-refund ownership token. The refund service keys its
-        // payout idempotency on this, so a retried claim cannot pay twice.
-        const claimant = 'gw:' + v.nonce;
+        // R18/R19: a PER-ATTEMPT ownership token, not a stable one. A stable
+        // token deadlocked this loop's own retry: after a failed payout the next
+        // attempt saw its own live claim and refused forever, stranding settled
+        // funds. The idempotency_key below (not this token) is what stops a
+        // DOUBLE payout -- the token only arbitrates WHO executes now.
+        const claimant = 'gw:' + v.nonce + ':' + Date.now().toString(36) +
+          ':' + Math.random().toString(36).slice(2, 10);
         const claim = await dStub.fetch('https://internal/claim-refund', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ nonce: v.nonce, payer: v.payer,
@@ -705,8 +709,14 @@ export default {
       if (parsed.download_url) body.download_via = '/v1/compress/result?ref=' + encodeURIComponent(JSON.stringify({
         key: parsed.output_key, bucket: parsed.output_bucket }));
       // R90: a 2xx carrying a failure status is NOT a delivered conversion.
-      if (parsed && typeof parsed.status === 'string' && parsed.status !== 'success') {
-        const refundedF = await recordRefund('engine_reported_' + parsed.status);
+      // R19: a paid result is delivered ONLY on an explicit success status. A
+      // missing/non-string status used to fall through and be delivered as a
+      // success after payment -- unverifiable output for collected funds.
+      const engineOk = parsed && typeof parsed.status === 'string' &&
+        parsed.status.toLowerCase() === 'success';
+      if (!engineOk) {
+        const refundedF = await recordRefund('engine_reported_' +
+          (typeof parsed.status === 'string' ? parsed.status : 'missing_status'));
         const safeStatus = (typeof parsed.status === 'string' && parsed.status.length <= 60
           && !/(?:AKIA|sk[-_]|secret|token|passwd)/i.test(parsed.status)) ? parsed.status : 'error';
         return json({ error: 'engine_reported_failure', engine_status: safeStatus,

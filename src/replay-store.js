@@ -32,17 +32,26 @@ export class ConsumedTxStore {
           // The payout is provably done: idempotent success, nobody re-executes.
           return this.json({ ok: true, alreadyRefunded: true }, 200);
         }
-        // R18: a record exists but was never COMPLETED. Its status carries the
-        // claimant id, so only that owner may execute the payout; every other
-        // caller is refused. Without this, two concurrent retries both saw
-        // "ok" and both executed the same refund.
-        if (prior.claimant) {
+        // R18/R19: a record exists but was never COMPLETED. Refuse a CONCURRENT
+        // duplicate (another live attempt owns it) so two callers can never both
+        // execute the same payout.
+        const STALE_MS = 60_000;
+        const age = Date.now() - Number(prior.at || 0);
+        const isStale = !Number.isFinite(age) || age > STALE_MS;
+        const sameClaimant = prior.claimant && prior.claimant === body.claimant;
+        if (prior.claimant && !sameClaimant && !isStale) {
           return this.json({ ok: true, claimed: false, claimedBy: prior.claimant }, 200);
         }
-        // Legacy record with no owner (written before R18): adopt it atomically
-        // rather than double-paying, and refuse the newcomer.
-        await this.state.storage.put(key, { ...prior, claimStatus: "orphaned" });
-        return this.json({ ok: true, claimed: false, claimedBy: "legacy" }, 200);
+        // Either (a) the SAME attempt resuming its own failed payout, or
+        // (b) takeover of a claim nobody finished, which would otherwise strand
+        // the payer's settled funds forever. Rotate ownership durably.
+        await this.state.storage.put(key, {
+          ...prior,
+          claimant: body.claimant || "gateway",
+          claimStatus: "rotated",
+          rotatedAt: Date.now(),
+        });
+        return this.json({ ok: true, claimed: true, rotated: true }, 200);
       }
       await this.state.storage.put(key, {
         nonce: String(body.nonce),
