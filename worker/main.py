@@ -338,6 +338,22 @@ def _assert_resolved_public(host: str) -> str:
     return _resolve_all_public(host)
 
 
+def _job_id_from_filename(filename):
+    """Extract the gateway's per-job prefix from an inbound filename.
+
+    src/index.js (R44) rewrites the outbound upload name to
+    "<16-hex job id>-<original stem><ext>", derived from the paid authorization
+    nonce. That prefix is the ONLY thing distinguishing two concurrent jobs that
+    picked the same output path, so it must be recovered here and used to
+    namespace the key. Returns '' if the name does not carry one.
+    """
+    stem = str(filename or "").replace("\\", "/").split("/")[-1]
+    head = stem.split("-", 1)[0]
+    if len(head) == 16 and all(c in "0123456789abcdef" for c in head.lower()):
+        return head.lower()
+    return ""
+
+
 def make_client(endpoint_url, access_key, secret_key):
     # R28: validate the addresses boto3 is about to use, not just the host text.
     try:
@@ -448,7 +464,16 @@ async def compress(file: UploadFile, target_destination: str = Form(None)):
             stem = parts.pop() if parts else "upload"
             if "." in stem:
                 stem = stem[: -(len(stem.rsplit(".", 1)[-1]) + 1)]
-            key = ("/".join(parts) + "/" if parts else "") + stem[:128] + ".parquet"
+            # R52: namespace every key by the job id. The gateway prefixes the
+            # inbound filename with the paid authorization nonce (R44), but the
+            # BYO path previously preferred the caller's raw file_path, so two
+            # customers writing "data.parquet" targeted the SAME object -- one
+            # silently overwrote the other and a payer could be served another
+            # tenant's file. The caller's path is still honoured, just under a
+            # per-job prefix so concurrent jobs cannot collide.
+            job_prefix = _job_id_from_filename(file.filename)
+            key = ((job_prefix + "/") if job_prefix else "") + \
+                  ("/".join(parts) + "/" if parts else "") + stem[:128] + ".parquet"
             internal = False
         else:
             endpoint = os.getenv("R2_ENDPOINT_URL")
