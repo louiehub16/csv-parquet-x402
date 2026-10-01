@@ -948,6 +948,12 @@ export default {
             : cleanStr(parsed[k], k === 'warning' ? 200 : 120);
         } else if (typeof parsed[k] === 'number' && Number.isFinite(parsed[k])) {
           body[k] = parsed[k];
+        } else if (typeof parsed[k] === 'boolean') {
+          // R36: booleans were never copied, so the documented drift_fallback
+          // flag was silently dropped and a client could not tell whether the
+          // engine fell back to all-string parsing. Coerce nothing -- only a
+          // real boolean is relayed.
+          body[k] = parsed[k];
         } else if (k === 'skipped_columns' && Array.isArray(parsed[k])) {
           body[k] = parsed[k].slice(0, 100).map((c) => cleanStr(c, 80)).filter(Boolean);
         }
