@@ -363,7 +363,7 @@ export default {
       const est = estimateCostUsd(size, env);
       // numEnv: a NaN/garbage ceiling env var must fail SAFE (default cap),
       // never disable the cap.
-      const cap = numEnv(tier.requiresUserDest ? env.SG_MAX_USERDEST_JOB_COST : env.SG_MAX_JOB_COST, tier.requiresUserDest ? 25 : 0.50);
+      const cap = numEnv(tier.requiresUserDest ? env.SG_MAX_USERDEST_JOB_COST : env.SG_MAX_JOB_COST, tier.requiresUserDest ? 25 : 1.00);
       if (est > cap)
         return json({ error: 'ceiling_exceeded', estimated_cost_usd: Number(est.toFixed(4)), cap_usd: cap }, 400);
 
@@ -495,7 +495,8 @@ export default {
       });
       if (!v.ok) {
         if (v.refundRequired || v.refundable) {
-          // R70: payment was taken but settlement failed terminally — refund now.
+          // R86: refund now; report 'required' (operator action) whenever the
+          // durable claim could not be created, never a bare 'queued'.
           const refunded = await recordRefund(v.reason || 'settlement_terminal_failure');
           paymentSettled = true;              // funds were collected
           return json({ error: 'settlement_failed', reason: v.reason,
@@ -562,8 +563,12 @@ export default {
                     } catch (_) {}
                   })());
                 }
-                const refunded = await recordRefund('gateway_timeout');
-                return json({ error: 'gateway_timeout', refund: refunded ? 'completed' : 'queued' }, 504);
+                // R85: a timeout may leave compute running and billing, so the
+                // payer is NOT auto-refunded (that would lose real spend). The
+                // claim and reservation both stand; support can settle it.
+                return json({ error: 'gateway_timeout', refund: 'not_applicable',
+                  note: 'upstream job may still be running; support will reconcile' },
+                  504);
               }
               // R24 + OX-ALPHA: only a genuine network drop that occurs before
               // RunPod accepted (upstream_unreachable) guarantees no compute was
@@ -572,7 +577,7 @@ export default {
               // OX-ALPHA (FIX-3): unified ':reconcile' key on ALL reconciles.
               // R56: dispatch was ATTEMPTED — compute may have started, so
               // reconcile to the reserved estimate, never $0.
-              ctx.waitUntil(reconcileDailyBudget(env, budgetTxId + ':reconcile', est).catch(() => {}))
+              ctx.waitUntil(reconcileDailyBudget(env, budgetTxId + ':reconcile', est).catch(() => {}));
         // R25: release the pre-dispatch nonce claim — no compute was bought/delivered.
         // R55: a settled payment has been COLLECTED — never release its claim.
         // Only an unsettled, undispatched claim may be released.
@@ -616,7 +621,8 @@ export default {
         // request ids, storage endpoints or signed URLs. Generic error only;
         // details stay in worker logs (observability streams the raw tail).
         const refundedE = await recordRefund('upstream_error');
-        return json({ error: 'upstream_error', upstream_status: upstream.status, refund: refundedE ? 'completed' : 'queued' }, 502);
+        return json({ error: 'upstream_error', upstream_status: upstream.status,
+          refund: refundedE ? 'completed' : 'queued' }, 502);
       }
       const text = await upstream.text();
       let parsed;
@@ -693,7 +699,7 @@ export default {
       // underpayment loudly. Engine reports cost as estimated_cost_usd;
       // engine_cost_usd kept as a legacy field-name fallback.
       const ec = body.estimated_cost_usd ?? body.engine_cost_usd;
-      if (typeof ec === 'number' && v.amountMicro / 1e6 < ec)
+      if (typeof ec === 'number' && Number(v.amountMicroUsdc) / 1e6 < ec)
         body.spend_warning = 'paid below engine cost';
 
       // (10) SETTLE BOOKKEEPING — allowlist body is built FIRST; then both
@@ -709,22 +715,8 @@ export default {
       // DO (strongly consistent). Fail-closed: if consumption cannot be
       // confirmed we refuse delivery — a replayable paid output is worse
       // than a retry. KV fallback burns best-effort with documented race.
-      // R34 FINALIZE: the gate-8 reservation is now made permanent by
-      // consumeNonce (DO atomic finalize, or a validBefore-aware KV marker).
-      // Failure here is fatal — a nonce that can't be burned means this
-      // authorization may be replayed, so we must not hand back the output.
-      {
-        try {
-          await consumeNonce(env, v.nonce, v.validBefore);
-        } catch (e) {
-          // OX-ALPHA: KV burn failed -> reconcile to est (NOT $0) since the job
-          // ran and billed compute; refusing delivery would waste it.
-          // OX-ALPHA (FIX-3): unified ':reconcile' key here too (amount stays
-          // est — the job genuinely billed compute).
-          ctx.waitUntil(reconcileDailyBudget(env, budgetTxId + ':reconcile', est).catch(() => {}));
-          return json({ error: 'nonce_consumption_failed' }, 503);
-        }
-      }
+      // R87: the nonce was already CLAIMED atomically before settlement
+      // (that claim is the consumption record) — no second burn here.
 
       return json(body, upstream.status);
     } catch (e) {
