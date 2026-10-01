@@ -572,6 +572,16 @@ export async function verifyPayment(env, request, opts = {}) {
       if (!transferConfirmed && s.definitelyNotSubmitted === true) {
         await releaseNonceClaim(env, nonceHex);
       }
+      // R37: the transfer is CONFIRMED on chain, so the payer has paid. Incomplete
+      // metadata cannot undo that -- return a refundable outcome or the gateway
+      // schedules no compensation and the money is stranded.
+      if (transferConfirmed) {
+        return {
+          ok: false, paid: true, refundRequired: true,
+          reason: 'settlement_proof_incomplete',
+          payer: auth.from, nonce: nonceHex, amountUsdc: String(auth.value),
+        };
+      }
       return challenge('settlement_proof_incomplete', 503);
     }
     if (lower(s.settledFrom) !== lower(auth.from) ||
@@ -582,6 +592,16 @@ export async function verifyPayment(env, request, opts = {}) {
       // belongs to a different authorization) — but an UNconfirmed one is not.
       if (!transferConfirmed && s.definitelyNotSubmitted === true) {
         await releaseNonceClaim(env, nonceHex);
+      }
+      // R37: a CONFIRMED transfer whose metadata belongs to a DIFFERENT
+      // authorization is still collected money. We must not deliver the work and
+      // must not silently keep the payment -- refund it and flag the mismatch.
+      if (transferConfirmed) {
+        return {
+          ok: false, paid: true, refundRequired: true,
+          reason: 'settlement_mismatch',
+          payer: auth.from, nonce: nonceHex, amountUsdc: String(auth.value),
+        };
       }
       return challenge('settlement_mismatch', 503);
     }
