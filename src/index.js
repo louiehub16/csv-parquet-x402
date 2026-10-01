@@ -188,18 +188,25 @@ export default {
         }
         const dId = env.CONSUMED_TX_STORE.idFromName('singleton');
         const dStub = env.CONSUMED_TX_STORE.get(dId);
+        // R18: a stable per-refund ownership token. The refund service keys its
+        // payout idempotency on this, so a retried claim cannot pay twice.
+        const claimant = 'gw:' + v.nonce;
         const claim = await dStub.fetch('https://internal/claim-refund', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ nonce: v.nonce, payer: v.payer,
-            amountUsdc: tier.microUsdc, reason, at: Date.now() }),
+            amountUsdc: tier.microUsdc, reason, claimant, at: Date.now() }),
         }).catch(() => null);
         if (!claim) return false;
         const cj = await claim.json().catch(() => null);
         if (!cj || cj.ok !== true) return false;        // DO unreachable
-        // A prior CLAIM is not a completed refund: retry the payout.
+        // The payout is provably done already: report success, execute nothing.
         if (cj.alreadyRefunded === true) return true;
+        // R18: the claim is live but owned by ANOTHER attempt. Executing here
+        // would double-refund the payer, so refuse and let the owner finish.
         if (cj.claimed === false) {
-          // Someone else holds the claim but never finished; try the payout.
+          console.error('[gateway] refund claim held by', cj.claimedBy || 'another',
+            'for', v.nonce, '— refusing duplicate payout');
+          return false;
         }
         // R83: the DO claim IS the durable record (it persists the claim in
         // its own storage partition). KV is a convenience mirror only.
@@ -227,7 +234,10 @@ export default {
               headers: { 'Content-Type': 'application/json',
                 Authorization: 'Bearer ' + (env.X402_REFUND_SECRET || '') },
               body: JSON.stringify({ nonce: v.nonce, payer: v.payer,
-                amountUsdc: tier.microUsdc, reason }),
+                amountUsdc: tier.microUsdc, reason, claimant,
+                // Idempotency key: the refund service must not pay twice for
+                // the same nonce even if this gateway retries the claim.
+                idempotency_key: 'refund:' + v.nonce }),
             });
             if (resp.ok) {
               record.status = 'refunded';

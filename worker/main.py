@@ -46,14 +46,29 @@ def mask_secret(s: str) -> str:
 
 _URL_RE = re.compile(r"https?://\S+")
 _AKIA_RE = re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")
+# R18: S3/botocore exception text embeds the CALLER's own secret access key and
+# session token, and an upstream endpoint may hand back a bearer credential.
+# Masking only URLs + AKIA/ASIA leaked those verbatim into the response body.
+# Order matters: longest/most specific pattern first, generic last.
+_CRED_ASSIGN_RE = re.compile(
+    r"(?i)\b(aws_secret_access_key|aws_access_key_id|secret_access_key|"
+    r"session_token|x_amz_security_token|bearer|authorization|api[_-]?key|"
+    r"secret|token|password|passwd|credential)\b\s*[:=]\s*[\"']?([^\s,\"';]{4,})")
+_BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._\-]{8,}")
+# A bare 40-char secret (classic AWS secret key shape) with no label nearby.
+_BARE_SECRET_RE = re.compile(r"\b[A-Za-z0-9/+=]{40}\b")
 
 
 def redact_message(err) -> str:
-    """Redact endpoint URLs and AKIA/ASIA keys from an exception/message so the
-    result is safe to embed in a (masked) HTTP response body while keeping the
-    user-facing diagnostic text intact. Raw credentials never leave the process."""
+    """Redact endpoint URLs, access-key ids, and generic credential material
+    from an exception/message so the result is safe to embed in a (masked) HTTP
+    response body while keeping the user-facing diagnostic text intact. Raw
+    credentials never leave the process."""
     msg = _URL_RE.sub("<redacted-url>", str(err or ""))
     msg = _AKIA_RE.sub("<redacted-key>", msg)
+    msg = _BEARER_RE.sub("Bearer <redacted>", msg)
+    # Keep the label (it is diagnostic) but never the value.
+    msg = _CRED_ASSIGN_RE.sub(lambda m: f"{m.group(1)}=<redacted>", msg)
     return msg
 
 
@@ -61,9 +76,7 @@ def log_diagnostic(where: str, err) -> None:
     """Internal stdout diagnostics ONLY — never an HTTP response body.
     Redacts endpoint URLs and AKIA-style keys, then masks the remainder."""
     try:
-        msg = _URL_RE.sub("<redacted-url>", str(err or ""))
-        msg = _AKIA_RE.sub("<redacted-key>", msg)
-        print(f"[engine] {where}: {mask_secret(msg)}", flush=True)
+        print(f"[engine] {where}: {mask_secret(redact_message(err))}", flush=True)
     except Exception:
         pass
 

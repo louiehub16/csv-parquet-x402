@@ -28,7 +28,21 @@ export class ConsumedTxStore {
       const prior = await this.state.storage.get(key);
       if (prior) {
         const done = prior && prior.status === "refunded";
-        return this.json({ ok: true, alreadyRefunded: !!done }, 200);
+        if (done) {
+          // The payout is provably done: idempotent success, nobody re-executes.
+          return this.json({ ok: true, alreadyRefunded: true }, 200);
+        }
+        // R18: a record exists but was never COMPLETED. Its status carries the
+        // claimant id, so only that owner may execute the payout; every other
+        // caller is refused. Without this, two concurrent retries both saw
+        // "ok" and both executed the same refund.
+        if (prior.claimant) {
+          return this.json({ ok: true, claimed: false, claimedBy: prior.claimant }, 200);
+        }
+        // Legacy record with no owner (written before R18): adopt it atomically
+        // rather than double-paying, and refuse the newcomer.
+        await this.state.storage.put(key, { ...prior, claimStatus: "orphaned" });
+        return this.json({ ok: true, claimed: false, claimedBy: "legacy" }, 200);
       }
       await this.state.storage.put(key, {
         nonce: String(body.nonce),
@@ -37,6 +51,10 @@ export class ConsumedTxStore {
         reason: body.reason || "unspecified",
         at: body.at || Date.now(),
         status: "claimed",
+        // R18: durable ownership token. The refund service must key its payout
+        // idempotency on this so a retried claim cannot pay twice.
+        claimant: body.claimant || "gateway",
+        claimStatus: "owned",
       });
       return this.json({ ok: true, claimed: true }, 200);
     }

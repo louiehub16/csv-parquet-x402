@@ -37,10 +37,12 @@ Payment flow:
    micro-USDC amount computed per-request from your byte size.
 3. Sign the EIP-3009 TransferWithAuthorization for exactly that amount.
 4. Retry the identical request with a `PAYMENT-SIGNATURE` header carrying the
-   signed authorization (base64url JSON). The gateway verifies the signature
-   offline and the conversion then runs and returns 200. NOTE: there is
-   currently NO durable payment record or collectible settlement — the
-   authorization is verified and discarded. Automated settlement is roadmap.
+   signed authorization (base64url JSON). The gateway verifies the signature,
+   settles it with the Coinbase CDP facilitator, and only then runs the
+   conversion. A successful response carries the on-chain `settled_tx`
+   settlement proof; if conversion cannot be delivered after a successful
+   settlement, the payment is refunded and the response reports
+   `refund: completed` (or `required` if a refund needs operator action).
 
 Free health probe: **GET** `/health`.
 

@@ -183,9 +183,9 @@
                     "estimated_cost_usd": {
                       "type": "number"
                     },
-                    "download_url": {
+                    "download_via": {
                       "type": "string",
-                      "description": "presigned link; internal destination only (24h retention)"
+                      "description": "Controlled result endpoint (/v1/compress/result?ref=...). The engine's presigned download_url is deliberately NOT relayed — the signed query string is itself a bearer credential — so clients fetch through this endpoint instead."
                     },
                     "warning": {
                       "type": "string"
