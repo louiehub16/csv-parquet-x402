@@ -469,7 +469,15 @@ export async function verifyPayment(env, request, opts = {}) {
     // R44: a transport error here is AMBIGUOUS (the transfer may have landed),
     // so KEEP the claim — releasing invites a double-delivery race against a
     // late settlement. The client must present a FRESH authorization.
-    return challenge('settlement_failed', 502);
+    // R39: but a bare challenge discards the payer/nonce, so the gateway's
+    // catch-all has nothing to refund with and a possibly-collected payment is
+    // stranded. Return the AMBIGUOUS-but-REFUNDABLE shape with the verified
+    // payer and nonce preserved.
+    return {
+      ok: false, paid: true, refundRequired: true, settledUnknown: true,
+      reason: 'settlement_failed',
+      payer: auth.from, nonce: nonceHex, amountUsdc: String(auth.value),
+    };
   }
   if (!settlement || settlement.ok !== true) {
     // R69: distinguish (a) nothing was submitted (retryable, release the claim)

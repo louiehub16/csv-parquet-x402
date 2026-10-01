@@ -622,7 +622,14 @@ export default {
         // R54: settlement is PART of verification — ok:true only after a
         // confirmed transfer AND a consumed nonce.
         settle: async (_payment, info) => {
-          if (!cdpConfigured(env)) return { ok: false, reason: 'settlement_not_configured' };
+          // R39: we bail BEFORE contacting the facilitator, so nothing was
+          // submitted. Say so explicitly, or the nonce claim taken by
+          // verifyPayment stays consumed and this authorization can never be
+          // retried -- a lockout for a purely configuration-driven refusal.
+          if (!cdpConfigured(env)) {
+            return { ok: false, reason: 'settlement_not_configured',
+              definitelyNotSubmitted: true, retryable: true };
+          }
           const hdrB64 = request.headers.get('PAYMENT-SIGNATURE')
             || request.headers.get('X-PAYMENT') || '';
           // R74: CLAIM FIRST. The DO reserve is atomic, so two concurrent
