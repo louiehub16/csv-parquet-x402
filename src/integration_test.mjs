@@ -122,7 +122,11 @@ globalThis.fetch = async (url, opts) => {  const u0 = String(url);
   }
   const f = opts.body.get('file');
   capturedName = f.name;
-  return new Response(JSON.stringify({ status: 'success', estimated_cost_usd: 0.000001 }), { status: 200 });
+  // R27: a real engine returns the output identifiers. 'success' WITHOUT them
+  // is not a delivered conversion (nothing to fetch, no receipt to write),
+  // so the gateway now refuses it -- the fixture must model the real shape.
+  return new Response(JSON.stringify({ status: 'success', estimated_cost_usd: 0.000001,
+    output_bucket: 'test-bucket', output_key: 'converted/tiny.parquet' }), { status: 200 });
 };
 try {
   const fd = new FormData();

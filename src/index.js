@@ -943,6 +943,20 @@ export default {
         return json({ error: 'engine_reported_failure', engine_status: safeStatus,
           refund: refundedF ? 'completed' : 'required' }, 502);
       }
+      // R27: 'success' alone is not a delivered conversion. Without
+      // output_key + output_bucket there is no object the payer can fetch and
+      // no receipt to write, so the payment would be collected for nothing.
+      // The download_via ref above is built from these same two fields, so
+      // require BOTH before treating the job as fulfilled.
+      const hasResult = typeof parsed.output_key === 'string' && parsed.output_key.length > 0 &&
+        typeof parsed.output_bucket === 'string' && parsed.output_bucket.length > 0;
+      if (!hasResult) {
+        const refundedNR = await recordRefund('engine_success_without_output');
+        console.error('[gateway] engine reported success without output identifiers for',
+          v && v.nonce);
+        return json({ error: 'engine_result_incomplete',
+          refund: refundedNR ? 'completed' : 'required' }, 502);
+      }
       // R24: persist a RESULT RECEIPT for the delivered object, keyed by the
       // paid authorization nonce. /v1/compress/result now requires the ref's
       // nonce to match a receipt that was recorded for a SETTLED, DELIVERED job

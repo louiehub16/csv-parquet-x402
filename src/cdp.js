@@ -189,7 +189,20 @@ function reasonString(errBody) {
 
 function isPermanentRejection(status, errBody) {
   if (status === 402) return true; // explicit payment verdict
-  if (status === 409) return true; // conflict / already settled (payment domain)
+  if (status === 409) {
+    // R27: a 409 is NOT proof that nothing settled. "already settled" means the
+    // transfer very likely DID move (this is a retry of a payment that already
+    // completed), so classifying it as definitely-not-submitted released the
+    // nonce and scheduled no refund -- the payer paid and got nothing.
+    // Only a 409 that names a genuinely unusable authorization (a different
+    // payer/amount/recipient conflict) is a clean "nothing moved" answer.
+    const r = reasonString(errBody);
+    if (/already.{0,40}(?:settled|used|consumed|complete)/i.test(r) &&
+        !/conflict|does not match|different|mismatch/i.test(r)) {
+      return false;   // ambiguous: treat as settled-unknown -> refund path
+    }
+    return true;
+  }
   if (status === 400 || status === 422) {
     const r = reasonString(errBody);
     // (a) Auth-layer failures are NEVER permanent.
