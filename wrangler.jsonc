@@ -18,11 +18,12 @@
       { "name": "CONSUMED_TX_STORE", "class_name": "ConsumedTxStore" }
     ]
   },
-  // R46: the internal output bucket. The gateway mints a SHORT-LIVED presigned
-  // GET from this binding for a paying customer, so a result that lands in
-  // provider storage is actually retrievable (previously the customer got only
-  // bucket+key, which they have no credentials for). bucket_name MUST match
-  // R2_BUCKET_NAME, which the engine uses to write.
+  // R46: the internal output bucket. After a durable receipt exists AND the
+  // EIP-712 payer has been verified against it, the gateway STREAMS the object
+  // to that customer -- so a result in provider storage is actually
+  // retrievable (previously they received only bucket+key, which they have no
+  // credentials for). No presigned URL and no S3 credentials are involved.
+  // bucket_name MUST match R2_BUCKET_NAME, which the engine writes with.
   "r2_buckets": [
     {
       "binding": "RESULTS",
