@@ -589,14 +589,23 @@ export default {
             if (all[i] === 0x00) { nul = true; break; }
           }
           if (nul) return json({ error: 'null_byte_detected' }, 400);
-          // Embedded archive/PDF magic anywhere in the body, not just at byte 0.
-          for (let i = 0; i + 1 < all.length; i++) {
-            if ((all[i] === 0x50 && all[i + 1] === 0x4b) ||           // PK (zip)
-                (all[i] === 0x1f && all[i + 1] === 0x8b) ||           // gzip
-                (all[i] === 0x25 && all[i + 1] === 0x50 &&
-                 all[i + 2] === 0x44 && all[i + 3] === 0x46)) {       // %PDF
-              return json({ error: 'archive_or_binary_detected' }, 400);
-            }
+          // R50: magic is checked at the START of the body only (after an
+          // optional UTF-8 BOM). Scanning the whole body for these byte pairs
+          // rejected LEGITIMATE data: a CSV cell containing "PK", a product code
+          // starting "%PD", or any gzip-ish pair anywhere in a 100 MB file was
+          // refused as binary. Container magic is a property of the file's
+          // first bytes, not of its interior.
+          let m = 0;
+          // Skip a UTF-8 BOM if present (EF BB BF).
+          if (all.length >= 3 && all[0] === 0xef && all[1] === 0xbb && all[2] === 0xbf) m = 3;
+          const magic = (i) => (
+            (all[i] === 0x50 && all[i + 1] === 0x4b) ||               // PK (zip)
+            (all[i] === 0x1f && all[i + 1] === 0x8b) ||               // gzip
+            (all[i] === 0x25 && all[i + 1] === 0x50 &&                // %PDF
+             all[i + 2] === 0x44 && all[i + 3] === 0x46)
+          );
+          if (all.length - m >= 2 && magic(m)) {
+            return json({ error: 'archive_or_binary_detected' }, 400);
           }
         }
       }
@@ -948,8 +957,9 @@ export default {
                 // $0 here.
                 // R26: release the nonce claim on timeout — client got no output.
                 // R55: a settled payment has been COLLECTED — never release its claim.
-        // R49: release only when the engine never RESPONDED (upstreamAccepted
-        // false) -- an ATTEMPTED dispatch is not a started one, and a collected
+        // R49: release only when the engine never RESPONDED
+        // (upstreamAccepted false) -- an ATTEMPTED dispatch is not a started
+        // one, and a collected
         // payment is never released.
         if (env.CONSUMED_TX_STORE && v && v.nonce && !paymentSettled && !upstreamAccepted) {
                   ctx.waitUntil((async () => {
@@ -1006,8 +1016,9 @@ export default {
               ctx.waitUntil(reconcileDailyBudget(env, budgetTxId + ':reconcile', est).catch(() => {}));
         // R49: engine never responded -> no compute bought -> release the claim.
         // R55: a settled payment has been COLLECTED — never release its claim.
-        // R49: release only when the engine never RESPONDED (upstreamAccepted
-        // false) -- an ATTEMPTED dispatch is not a started one, and a collected
+        // R49: release only when the engine never RESPONDED
+        // (upstreamAccepted false) -- an ATTEMPTED dispatch is not a started
+        // one, and a collected
         // payment is never released.
         if (env.CONSUMED_TX_STORE && v && v.nonce && !paymentSettled && !upstreamAccepted) {
           ctx.waitUntil((async () => {
@@ -1033,8 +1044,9 @@ export default {
         ctx.waitUntil(reconcileDailyBudget(env, budgetTxId + ':reconcile', est).catch(() => {}));
         // R49: engine never responded -> no compute bought -> release the claim.
         // R55: a settled payment has been COLLECTED — never release its claim.
-        // R49: release only when the engine never RESPONDED (upstreamAccepted
-        // false) -- an ATTEMPTED dispatch is not a started one, and a collected
+        // R49: release only when the engine never RESPONDED
+        // (upstreamAccepted false) -- an ATTEMPTED dispatch is not a started
+        // one, and a collected
         // payment is never released.
         if (env.CONSUMED_TX_STORE && v && v.nonce && !paymentSettled && !upstreamAccepted) {
           ctx.waitUntil((async () => {
@@ -1064,8 +1076,9 @@ export default {
         ctx.waitUntil(reconcileDailyBudget(env, budgetTxId + ':reconcile', est).catch(() => {}));
         // R49: engine never responded -> no compute bought -> release the claim.
         // R55: a settled payment has been COLLECTED — never release its claim.
-        // R49: release only when the engine never RESPONDED (upstreamAccepted
-        // false) -- an ATTEMPTED dispatch is not a started one, and a collected
+        // R49: release only when the engine never RESPONDED
+        // (upstreamAccepted false) -- an ATTEMPTED dispatch is not a started
+        // one, and a collected
         // payment is never released.
         if (env.CONSUMED_TX_STORE && v && v.nonce && !paymentSettled && !upstreamAccepted) {
           ctx.waitUntil((async () => {
@@ -1121,7 +1134,14 @@ export default {
       }
       // R64: do NOT relay the engine's presigned download_url — the signed
       // query string IS a bearer credential. Advertise the controlled endpoint.
-      if (parsed.download_url) body.download_via = '/v1/compress/result?ref=' + encodeURIComponent(JSON.stringify({
+      // R51: `download_via` is built from output_bucket + output_key, which are
+      // validated above. Do NOT gate it on the engine returning download_url:
+      // a BYO conversion writes to the caller's own bucket and never has one, so
+      // those customers were told how to retrieve their result in llms.txt /
+      // mcp/config but the field was missing from the actual response. The
+      // presigned URL itself is still never relayed -- the ref points at our
+      // authenticated endpoint, and the engine's bearer query string stays out.
+      body.download_via = '/v1/compress/result?ref=' + encodeURIComponent(JSON.stringify({
         key: parsed.output_key, bucket: parsed.output_bucket }));
       // R90: a 2xx carrying a failure status is NOT a delivered conversion.
       // R19: a paid result is delivered ONLY on an explicit success status. A

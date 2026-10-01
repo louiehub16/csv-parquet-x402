@@ -107,6 +107,22 @@ const getResult = async (env, query = '') => {
   const cfg = readFileSync(new URL('../wrangler.jsonc', import.meta.url), 'utf8');
   ok('wrangler declares the r2_buckets binding', /"r2_buckets"/.test(cfg), 'no binding');
   ok('the binding is named RESULTS', /"binding"\s*:\s*"RESULTS"/.test(cfg), 'wrong name');
+
+  // R51: download_via must be built unconditionally once the identifiers are
+  // validated -- NOT gated on the engine returning download_url. A BYO
+  // conversion writes to the caller's own bucket and never has one, so those
+  // customers were told (in llms.txt / mcp/config) how to fetch their result but
+  // the field was missing from the response.
+  const dv = src.slice(src.indexOf('body.download_via'),
+                       src.indexOf('body.download_via') + 320);
+  ok('download_via is assigned unconditionally',
+     /^body\.download_via =/.test(dv.trim()) &&
+     !/if \(parsed\.download_url\)/.test(dv), 'still gated on download_url');
+  ok('download_via points at the authenticated result endpoint',
+     /\/v1\/compress\/result\?ref=/.test(dv), 'wrong endpoint');
+  ok('it carries only the key and bucket (no presigned URL is relayed)',
+     /key:\s*parsed\.output_key/.test(dv) && /bucket:\s*parsed\.output_bucket/.test(dv) &&
+     !/download_url/.test(dv), 'a presigned URL may be relayed');
 }
 
 // --- 2. a proven payer receives the actual bytes --------------------------

@@ -25,9 +25,16 @@ const ok = (label, cond, got) => { if (!cond) fails.push(`${label} — got ${JSO
   ok('it scans every byte for NUL, not just the head',
      /for \(let i = 0; i < all\.length; i\+\+\)/.test(block) && /all\[i\] === 0x00/.test(block),
      'no whole-buffer NUL scan');
-  ok('it scans for embedded archive magic, not only at offset 0',
-     /for \(let i = 0; i \+ 1 < all\.length; i\+\+\)/.test(block) &&
-     /0x50 && all\[i \+ 1\] === 0x4b/.test(block), 'no embedded-magic scan');
+  ok('it scans for archive magic at the FILE START (offset 0 / after a BOM)',
+     /const magic = \(i\) =>/.test(block) && /magic\(m\)/.test(block),
+     'no start-of-file magic check');
+  // R50: magic must NOT be searched across the whole body -- that rejected
+  // legitimate CSV containing "PK" or "%PD" in a cell.
+  ok('it does NOT scan the whole body for magic (that rejected real CSVs)',
+     !/for \(let i = 0; i \+ 1 < all\.length; i\+\+\)/.test(block),
+     'whole-body magic scan is back');
+  ok('a UTF-8 BOM is skipped before the magic check',
+     /0xef && all\[1\] === 0xbb && all\[2\] === 0xbf/.test(block), 'BOM not handled');
   ok('a NUL anywhere still returns null_byte_detected',
      /null_byte_detected/.test(block), 'missing error');
   ok('embedded magic returns archive_or_binary_detected',
@@ -88,6 +95,34 @@ const ok = (label, cond, got) => { if (!cond) fails.push(`${label} — got ${JSO
   ok('a clean 1.5 MB CSV is NOT rejected as binary',
      cleanRes.body.error !== 'null_byte_detected' &&
      cleanRes.body.error !== 'archive_or_binary_detected', cleanRes.body);
+
+  // R50: magic bytes ANYWHERE IN THE BODY must not reject legitimate data. A CSV
+  // cell containing "PK", a product code starting "%PD", or a gzip-looking pair
+  // is ordinary text; the earlier whole-body magic scan refused all of it.
+  for (const [needle, label] of [
+    ['PK', 'literal PK in a cell'],
+    ['%PDF', 'product code starting %PD'],
+    ['\x1f\x8b', 'gzip-looking byte pair'],
+    ['PK\x03\x04zipstuff', 'an embedded zip local-file header'],
+  ]) {
+    const withText = Uint8Array.from(clean);
+    const nBytes = new TextEncoder().encode(needle);
+    // plant it well past the 1 MiB boundary and past the head
+    withText.set(nBytes, 1024 * 1024 + 2048);
+    const r = await run(withText, label);
+    console.log(`${label.padEnd(34)}->`, r.status, JSON.stringify(r.body).slice(0, 60));
+    ok(`${label} is accepted (not treated as an archive)`,
+       r.body.error !== 'archive_or_binary_detected', r.body);
+  }
+  // ...but a file that ACTUALLY IS a zip must still be refused.
+  {
+    const zip = new Uint8Array(4096);
+    zip.set([0x50, 0x4b, 0x03, 0x04], 0);
+    const r = await run(zip, 'real zip');
+    console.log('real zip                 ->', r.status, JSON.stringify(r.body).slice(0, 60));
+    ok('a genuine archive is still rejected',
+       r.body.error === 'archive_or_binary_detected' || r.status === 400, r.body);
+  }
 }
 
 for (const f of fails) console.log('FAIL:', f);
