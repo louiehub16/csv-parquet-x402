@@ -7,7 +7,6 @@
 import {
   twaDigest, pubkeyToAddress, recover,
 } from './x402.js';
-import { readFileSync } from 'node:fs';
 
 const HALF_N = 0x7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0n;
 
