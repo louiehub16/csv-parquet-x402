@@ -8,10 +8,14 @@
 A serverless data-conversion endpoint for delimited-text files. Today's public
 endpoint accepts uploads up to ~100 MB per request (direct multi-GB streaming
 is roadmap), emitting ZSTD-compressed Apache Parquet. Inputs under 10 GB
-land automatically in provider R2 temp storage (24-hour lifecycle) with a
-presigned download link returned in the response; inputs at or above 10 GB
-require the caller to supply an S3-compatible `target_destination` where the
-result is written permanently on the caller's own storage.
+land automatically in provider R2 temp storage (24-hour lifecycle). The
+response carries `download_via`, a controlled result endpoint -- the engine's
+own presigned link is deliberately NOT returned, because a presigned query
+string is itself a bearer credential. GET `/v1/compress/result?ref=...` with the
+same `PAYMENT-SIGNATURE` header used to pay, and it returns the storage
+coordinates for your object. Inputs at or above 10 GB require the caller to
+supply an S3-compatible `target_destination` where the result is written
+permanently on the caller's own storage.
 
 - Input formats: `.csv`, `.tsv`, `.txt` (delimited text)
 - Output format: Apache Parquet with ZSTD compression (`parquet+zstd`)

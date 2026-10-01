@@ -54,6 +54,16 @@ manifest carrying the exact micro-USDC price computed from your file's byte size
 <a style="color:#79c0ff" href="/openapi.json">/openapi.json</a> ·
 <a style="color:#79c0ff" href="/mcp/config">/mcp/config</a></p></body></html>`;
 
+// Extract the authorization nonce from a base64url PAYMENT-SIGNATURE header.
+function nonceFromHeader(hdr) {
+  try {
+    const dec = JSON.parse(atob(String(hdr || '').replace(/-/g, '+').replace(/_/g, '/')
+      + '==='.slice(0, (4 - String(hdr).length % 4) % 4)));
+    return dec && dec.payload && dec.payload.authorization && dec.payload.authorization.nonce
+      ? String(dec.payload.authorization.nonce).replace(/^0x/, '').toLowerCase() : null;
+  } catch (e) { return null; }
+}
+
 function sanitizeKey(name) {
   // Output-key sanitization (the destination-key layer). SQL strings in CSV
   // DATA are deliberately NOT rejected at input — legit datasets contain them;
@@ -106,26 +116,46 @@ export default {
     // mint or relay.
     if (request.method === 'GET' && path === '/v1/compress/result') {
       try {
+        // R24: proof of payment must resolve to a nonce that has a durable
+        // RECEIPT for a settled, delivered conversion. A bare non-empty header
+        // is not payment -- that let anyone read coordinates they never bought.
         const proof = request.headers.get('PAYMENT-SIGNATURE') ||
           request.headers.get('X-PAYMENT') || '';
         if (!proof) {
           return json({ error: 'payment_proof_required',
             message: 'Send the PAYMENT-SIGNATURE header used for the paid conversion.' }, 402);
         }
+        const nonce = nonceFromHeader(proof);
+        if (!nonce) return json({ error: 'bad_payment_header' }, 400);
+        const receiptRaw = await env.SECURITY_KV.get('result:' + nonce)
+          .catch(() => null);
+        if (!receiptRaw) {
+          return json({ error: 'result_not_found',
+            message: 'No delivered conversion is recorded for this payment.' }, 404);
+        }
+        let receipt = null;
+        try { receipt = JSON.parse(receiptRaw); } catch (e) { receipt = null; }
+        if (!receipt || receipt.nonce !== nonce) {
+          return json({ error: 'result_not_found' }, 404);
+        }
+        // The caller may pass a ref, but the RECEIPT is authoritative: it can
+        // only ever expose the object that THIS paid nonce actually produced.
         let refObj = null;
         try { refObj = JSON.parse(url.searchParams.get('ref') || ''); }
         catch (e) { refObj = null; }
-        if (!refObj || typeof refObj !== 'object' || Array.isArray(refObj)) {
-          return json({ error: 'bad_ref' }, 400);
+        if (refObj && typeof refObj === 'object' && !Array.isArray(refObj) &&
+            refObj.key && sanitizeKey(String(refObj.key)) !== String(receipt.key)) {
+          return json({ error: 'ref_mismatch',
+            message: 'That ref does not belong to this payment.' }, 403);
         }
-        // sanitizeKey strips traversal; a key that does not survive it is refused.
-        const key = sanitizeKey(String(refObj.key || ''));
-        const bucket = String(refObj.bucket || '');
-        if (!key || !bucket) return json({ error: 'bad_ref' }, 400);
+        const key = sanitizeKey(String(receipt.key || ''));
+        const bucket = String(receipt.bucket || '');
+        if (!key || !bucket) return json({ error: 'result_not_found' }, 404);
         return json({
           status: 'ready',
           bucket,
           key,
+          settled_tx: receipt.settledTx || null,
           note: 'Object is private. Fetch it with a presigned GET from your own ' +
                 'S3/R2 client using the credentials you supplied; the gateway ' +
                 'does not mint or relay presigned URLs.',
@@ -842,6 +872,20 @@ export default {
           && !/(?:AKIA|sk[-_]|secret|token|passwd)/i.test(parsed.status)) ? parsed.status : 'error';
         return json({ error: 'engine_reported_failure', engine_status: safeStatus,
           refund: refundedF ? 'completed' : 'required' }, 502);
+      }
+      // R24: persist a RESULT RECEIPT for the delivered object, keyed by the
+      // paid authorization nonce. /v1/compress/result now requires the ref's
+      // nonce to match a receipt that was recorded for a SETTLED, DELIVERED job
+      // -- previously it accepted any non-empty payment header, so anybody
+      // could echo a dummy header and read coordinates they never paid for.
+      if (v && v.nonce && parsed && typeof parsed.output_key === 'string') {
+        const receipt = {
+          nonce: v.nonce, payer: v.payer || null, amountUsdc: tier.microUsdc,
+          bucket: parsed.output_bucket || null, key: parsed.output_key,
+          settledTx: v.settledTx || null, at: Date.now(),
+        };
+        ctx.waitUntil(env.SECURITY_KV.put('result:' + v.nonce,
+          JSON.stringify(receipt), { expirationTtl: 604800 }).catch(() => {}));
       }
       if (v && v.settledTx) body.settled_tx = v.settledTx;
       else if (v && v.settlePending) body.settle_pending = true;
