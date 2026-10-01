@@ -18,6 +18,17 @@
       { "name": "CONSUMED_TX_STORE", "class_name": "ConsumedTxStore" }
     ]
   },
+  // R46: the internal output bucket. The gateway mints a SHORT-LIVED presigned
+  // GET from this binding for a paying customer, so a result that lands in
+  // provider storage is actually retrievable (previously the customer got only
+  // bucket+key, which they have no credentials for). bucket_name MUST match
+  // R2_BUCKET_NAME, which the engine uses to write.
+  "r2_buckets": [
+    {
+      "binding": "RESULTS",
+      "bucket_name": "REPLACE_WITH_R2_BUCKET_NAME"
+    }
+  ],
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["ConsumedTxStore"] }
   ],

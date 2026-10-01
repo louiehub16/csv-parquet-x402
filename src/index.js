@@ -113,6 +113,28 @@ function sanitizeKey(name) {
   return (stem || 'upload') + '.parquet';
 }
 
+// R46: fetch the result object for its verified payer.
+//
+// Why STREAM rather than presign: Cloudflare's R2 Worker binding exposes
+// get() -> R2Object (arrayBuffer/text/body) and has NO presigning API on either
+// the bucket or the object. Presigning would require the Worker to hold S3
+// credentials -- exactly the material it must never have. So the gateway
+// proxies the bytes itself, and only ever after a durable receipt exists AND
+// the EIP-712 payer has been recovered and matched to it. The caller must
+// already be proven to be the payer; this adds no new authority.
+//
+// The key comes from the RECEIPT, never from caller input, so this cannot be
+// steered at another job's object.
+async function fetchR2Object(env, key) {
+  const bucket = env.RESULTS;
+  if (!bucket || typeof bucket.get !== 'function') {
+    throw new Error('RESULTS bucket binding unavailable');
+  }
+  const object = bucket.get(key);
+  if (!object) throw new Error('result object not found in bucket');
+  return object;
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -207,14 +229,61 @@ export default {
         const key = String(receipt.key || '');
         const bucket = String(receipt.bucket || '');
         if (!key || !bucket) return json({ error: 'result_not_found' }, 404);
+
+        // R46: DELIVER the object. A customer who did not supply BYO storage
+        // has no credentials for the internal bucket, so returning only
+        // bucket+key made paid results UNRETRIEVABLE -- the service was unusable
+        // in its default mode (<10 GB, no target_destination).
+        //
+        // We proxy the bytes rather than presigning: R2's Worker binding has no
+        // presigning API, and presigning would mean giving the Worker S3
+        // credentials it must never hold. This runs ONLY after a durable receipt
+        // exists and the EIP-712 payer has been recovered and matched to it, and
+        // the key comes from the RECEIPT -- never from caller input.
+        if (env.RESULTS) {
+          const filename = key.split('/').pop() || 'result.parquet';
+          const disposition = 'attachment; filename="' + filename.replace(/[^\w.\-]/g, '_') + '"';
+          try {
+            const object = await fetchR2Object(env, key);
+            // ?meta=1 returns the JSON descriptor without transferring bytes.
+            if (url.searchParams.get('meta') === '1') {
+              return json({
+                status: 'ready', bucket, key,
+                size: typeof object.size === 'number' ? object.size : null,
+                settled_tx: receipt.settledTx || null,
+                download_via: url.pathname + '?ref=' +
+                  encodeURIComponent(JSON.stringify({ key, bucket })) +
+                  '&meta=0 (GET this with your PAYMENT-SIGNATURE to stream the file)',
+                note: 'Objects are deleted ~24h after conversion; fetch before then.',
+              });
+            }
+            return new Response(object.body, {
+              status: 200,
+              headers: {
+                'Content-Type': 'application/vnd.apache.parquet',
+                'Content-Disposition': disposition,
+                'Cache-Control': 'no-store',
+                'X-Content-Type-Options': 'nosniff',
+              },
+            });
+          } catch (e) {
+            // Never fall back to "here are the coordinates" for an internal
+            // result -- that is the unusable state this replaces.
+            console.error('[result] object fetch failed for', key);
+            return json({ error: 'result_unavailable',
+              message: 'The result could not be read right now; try again shortly.' }, 503);
+          }
+        }
+
+        // No R2 binding: the object can only be in the caller's own bucket,
+        // where THEY hold the credentials.
         return json({
           status: 'ready',
           bucket,
           key,
           settled_tx: receipt.settledTx || null,
-          note: 'Object is private. Fetch it with a presigned GET from your own ' +
-                'S3/R2 client using the credentials you supplied; the gateway ' +
-                'does not mint or relay presigned URLs.',
+          note: 'Object is in YOUR bucket. Fetch it with a presigned GET using the ' +
+                'S3 credentials you supplied; the gateway does not hold them.',
         });
       } catch (e) {
         console.error('[result] retrieval failed:', (e && e.message) || e);
