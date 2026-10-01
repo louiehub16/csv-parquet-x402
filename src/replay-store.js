@@ -1,6 +1,14 @@
 // replay-store.js
 // Strongly-consistent reservation store. Each Durable Object instance owns its storage partition;
-// a single fixed id routes ALL reservations through one instance, so get+set is atomic w.r.t. requests.
+// a single fixed id routes ALL reservations through one instance.
+//
+// ATOMICITY (R42): a Durable Object serializes EVENTS, and its input gate keeps at
+// most one request in flight -- but it does NOT make a get-then-await-then-put
+// sequence atomic. A `const x = await get(k); if (!x) await put(k, v);` can interleave
+// with a second request that also observed absence, so both callers receive success.
+// That is a double refund and a nonce replay. Every read-modify-write decision
+// below is therefore wrapped in `state.storage.transaction()`, which retries the
+// callback on conflict, so the decision and the write commit together.
 //
 // R9 (AGENT C): extended without regressing the existing /reserve tx reservation.
 //   - POST /reserve       : on-chain tx reservation (R11-3: stores { transactionId }, idempotent retry 200 /
@@ -25,47 +33,62 @@ export class ConsumedTxStore {
       const body = await this.readBody(request);
       if (!body || !body.nonce) return this.json({ ok: false, error: "invalid_json" }, 400);
       const key = "refund:" + String(body.nonce);
-      const prior = await this.state.storage.get(key);
-      if (prior) {
-        const done = prior && prior.status === "refunded";
-        if (done) {
-          // The payout is provably done: idempotent success, nobody re-executes.
-          return this.json({ ok: true, alreadyRefunded: true }, 200);
+      // R42: claim, stale-takeover and completed-refund decisions are made
+      // INSIDE the transaction, so two concurrent callers cannot both observe
+      // absence and both execute the payout (a double refund).
+      const outcome = await this.state.storage.transaction(async (txn) => {
+        const prior = await txn.get(key);
+        if (prior) {
+          const done = prior && prior.status === "refunded";
+          if (done) {
+            // The payout is provably done: idempotent success, nobody re-executes.
+            return { kind: "already_refunded" };
+          }
+          // R18/R19: a record exists but was never COMPLETED. Refuse a CONCURRENT
+          // duplicate (another live attempt owns it) so two callers can never
+          // both execute the same payout.
+          const STALE_MS = 60_000;
+          const age = Date.now() - Number(prior.at || 0);
+          const isStale = !Number.isFinite(age) || age > STALE_MS;
+          const sameClaimant = prior.claimant && prior.claimant === body.claimant;
+          if (prior.claimant && !sameClaimant && !isStale) {
+            return { kind: "held", claimedBy: prior.claimant };
+          }
+          // Either (a) the SAME attempt resuming its own failed payout, or
+          // (b) takeover of a claim nobody finished, which would otherwise strand
+          // the payer's settled funds forever. Rotate ownership durably.
+          await txn.put(key, {
+            ...prior,
+            claimant: body.claimant || "gateway",
+            claimStatus: "rotated",
+            rotatedAt: Date.now(),
+          });
+          return { kind: "claimed", rotated: true };
         }
-        // R18/R19: a record exists but was never COMPLETED. Refuse a CONCURRENT
-        // duplicate (another live attempt owns it) so two callers can never both
-        // execute the same payout.
-        const STALE_MS = 60_000;
-        const age = Date.now() - Number(prior.at || 0);
-        const isStale = !Number.isFinite(age) || age > STALE_MS;
-        const sameClaimant = prior.claimant && prior.claimant === body.claimant;
-        if (prior.claimant && !sameClaimant && !isStale) {
-          return this.json({ ok: true, claimed: false, claimedBy: prior.claimant }, 200);
-        }
-        // Either (a) the SAME attempt resuming its own failed payout, or
-        // (b) takeover of a claim nobody finished, which would otherwise strand
-        // the payer's settled funds forever. Rotate ownership durably.
-        await this.state.storage.put(key, {
-          ...prior,
+        await txn.put(key, {
+          nonce: String(body.nonce),
+          payer: body.payer || null,
+          amountUsdc: body.amountUsd != null ? body.amountUsd : (body.amountUsdc || 0),
+          reason: body.reason || "unspecified",
+          at: body.at || Date.now(),
+          status: "claimed",
+          // R18: durable ownership token. The refund service must key its payout
+          // idempotency on this so a retried claim cannot pay twice.
           claimant: body.claimant || "gateway",
-          claimStatus: "rotated",
-          rotatedAt: Date.now(),
+          claimStatus: "owned",
         });
-        return this.json({ ok: true, claimed: true, rotated: true }, 200);
-      }
-      await this.state.storage.put(key, {
-        nonce: String(body.nonce),
-        payer: body.payer || null,
-        amountUsdc: body.amountUsd != null ? body.amountUsd : (body.amountUsdc || 0),
-        reason: body.reason || "unspecified",
-        at: body.at || Date.now(),
-        status: "claimed",
-        // R18: durable ownership token. The refund service must key its payout
-        // idempotency on this so a retried claim cannot pay twice.
-        claimant: body.claimant || "gateway",
-        claimStatus: "owned",
+        return { kind: "claimed", claimed: true };
       });
-      return this.json({ ok: true, claimed: true }, 200);
+
+      if (outcome.kind === "already_refunded") {
+        return this.json({ ok: true, alreadyRefunded: true }, 200);
+      }
+      if (outcome.kind === "held") {
+        return this.json({ ok: true, claimed: false, claimedBy: outcome.claimedBy }, 200);
+      }
+      return this.json(outcome.rotated
+        ? { ok: true, claimed: true, rotated: true }
+        : { ok: true, claimed: true }, 200);
     }
     if (method === "POST" && pathname === "/mark-refunded") {
       const body = await this.readBody(request);
@@ -196,12 +219,16 @@ export class ConsumedTxStore {
     const body = await this.readBody(request);
     if (!body || body.nonce == null) return this.json({ ok: false, error: "invalid_json" }, 400);
     const key = "nonce:" + String(body.nonce);
-    const existing = await this.state.storage.get(key);
-    if (existing) {
-      return this.json({ ok: false, already: "used" }, 409);
-    }
-    // Persist permanently (no TTL). A nonce is single-use for the life of the store.
-    await this.state.storage.put(key, { usedAt: Date.now() });
+    // R42: the decision and the write commit together. Two concurrent requests
+    // can no longer both observe absence and both reserve the same nonce.
+    const result = await this.state.storage.transaction(async (txn) => {
+      const existing = await txn.get(key);
+      if (existing) return { ok: false, already: "used" };
+      // Persist permanently (no TTL). A nonce is single-use for the life of the store.
+      await txn.put(key, { usedAt: Date.now() });
+      return { ok: true };
+    });
+    if (!result.ok) return this.json({ ok: false, already: result.already }, 409);
     return this.json({ ok: true }, 200);
   }
 

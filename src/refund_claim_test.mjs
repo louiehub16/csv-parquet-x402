@@ -20,11 +20,33 @@ const BASE = {
 };
 
 // Minimal in-memory Durable-Object storage.
+//
+// R42: models `storage.transaction(cb)` with REAL semantics -- a serialized
+// critical section over the same map, with rollback on throw. A plain get/put
+// pair is NOT atomic in a real Durable Object (the input gate allows an
+// interleaving between two awaits), which is exactly the bug R42 fixes, so the
+// fake must not accidentally make the old code look correct.
 class FakeStorage {
-  constructor() { this.map = new Map(); }
+  constructor() { this.map = new Map(); this._chain = Promise.resolve(); }
   async get(k) { return this.map.get(k); }
   async put(k, v) { this.map.set(k, v); }
   async delete(k) { this.map.delete(k); }
+  transaction(cb) {
+    // Serialize transactions and roll back if the callback throws, matching
+    // the real API's all-or-nothing guarantee.
+    const run = this._chain.then(async () => {
+      const backup = new Map(this.map);
+      try {
+        return await cb(this);
+      } catch (e) {
+        this.map.clear();
+        for (const [k, v] of backup) this.map.set(k, v);
+        throw e;
+      }
+    });
+    this._chain = run.then(() => undefined, () => undefined);
+    return run;
+  }
 }
 
 async function claim(store, payload) {
