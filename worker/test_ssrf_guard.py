@@ -62,22 +62,29 @@ def main():
 
     failures = []
 
-    # R40: transport hardening that is safe to assert, plus a guard against
-    # reintroducing a before-send redirect hook. before-send fires on EVERY
-    # request, so raising there would fail all S3 operations -- a worse defect
-    # than the redirect gap it would close. That gap stays a documented risk.
-    _src = open(os.path.join(HERE, "main.py"), encoding="utf-8").read()
-    if not ("signature_version=" in _src and "s3v4" in _src):
-        failures.append("no hardened transport config (s3v4 signature)")
-    if not ("connect_timeout=" in _src and "read_timeout=" in _src):
-        failures.append("no connect/read timeouts on the S3 client")
-    if '"max_attempts"' not in _src:
-        failures.append("no retry bound on the S3 client")
-    if 'register("before-send' in _src:
-        failures.append("a before-send guard is registered -- it fires on EVERY "
-                        "request and would fail all S3 operations")
-    if not ("accepted risk" in _src.lower() and "redirect" in _src.lower()):
-        failures.append("the redirect gap is not documented as an accepted risk")
+    # R40/R53: transport hardening now lives in s3_guard.py, and the redirect
+    # gap is CLOSED rather than merely documented -- the guard disables redirect
+    # following and pins the client to validated addresses. Assert against the
+    # guard module so this test tracks where the logic really is.
+    # This module collects into `failures`; it has no ok() helper.
+    src = open(os.path.join(HERE, "main.py"), encoding="utf-8").read()
+    guard_src = os.path.join(HERE, "s3_guard.py")
+    if not os.path.exists(guard_src):
+        failures.append("worker/s3_guard.py is missing -- R53 hardening not present")
+    else:
+        g = open(guard_src, encoding="utf-8").read()
+        if "import s3_guard" not in src:
+            failures.append("main.py does not import the S3 guard")
+        if "_r53_pinned_ips" not in g and "_pinned" not in g:
+            failures.append("the guard does not pin addresses (DNS-rebinding open)")
+        if "redirect" not in g.lower():
+            failures.append("the guard has no redirect handling")
+        if "s3v4" not in g:
+            failures.append("the guard does not use SigV4")
+        if "connect_timeout" not in g or "max_attempts" not in g:
+            failures.append("the guard does not bound timeouts/retries")
+        if "build_client(" not in src:
+            failures.append("make_client does not delegate to the guard")
 
     for url, should_reject, label in CASES:
         try:
