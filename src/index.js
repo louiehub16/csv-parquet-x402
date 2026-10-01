@@ -3,7 +3,7 @@
 // where it sits. SPENDGUARD DROP-IN POINTS are marked inline (blocks 2, 7, 10)
 // so the SpendGuard module can replace them without reordering anything.
 import {
-  tierForBytes, buildChallenge, verifyPayment, markNonceUsed, estimateCostUsd, consumeNonce,
+  tierForBytes, buildChallenge, verifyPayment, estimateCostUsd, consumeNonce,
 } from './x402.js';
 // CDP facilitator adapter (settlement rail) — installed for auto-indexing + collectibility.
 import { cdpConfigured, cdpVerifyAndSettle } from './cdp.js';
@@ -160,6 +160,9 @@ export default {
       // R28: hoisted so the outer catch block can access them for cleanup
       let v = null;
       let budgetTxId = null;
+      // R51/R55: dispatched = upstream work started; settled = payment collected.
+      let paymentSettled = false;
+      let upstreamDispatched = false;
       let form;
       try { form = await request.formData(); } catch (e) { return json({ error: 'bad_multipart' }, 400); }
       const file = form.get('file');
@@ -262,6 +265,34 @@ export default {
         if (res.spentUsd >= res.capUsd) return json({ error: 'daily_budget_exhausted' }, 503);
       }
 
+      // The nonce the settlement callback must burn (read from the header the
+      // verifier authenticated).
+      let v0Nonce = null;
+      {
+        const h = request.headers.get('PAYMENT-SIGNATURE') || request.headers.get('X-PAYMENT') || '';
+        try { const dec = JSON.parse(atob(h.replace(/-/g,'+').replace(/_/g,'/') + '==='.slice(0, (4 - h.length % 4) % 4)));
+              v0Nonce = dec?.payload?.authorization?.nonce
+                ? String(dec.payload.authorization.nonce).replace(/^0x/, '').toLowerCase() : null; }
+        catch (e) {}
+      }
+
+      // (7.9) RUNPOD BALANCE PREFLIGHT (SpendGuard) — BEFORE any payment, so we
+      //     never settle for work an unfunded upstream cannot run.
+      {
+        const pb = await spendguard.preflightRunpodBalance(env);
+        if (!pb.ok) return json({ error: 'upstream_balance_unavailable', note: pb.note }, pb.status);
+      }
+
+      // (7.95) ATOMIC BUDGET RESERVATION (SpendGuard DO) — before settlement;
+      //     a rejected job must never have charged the payer. Fully released
+      //     again by the catch-all (nothing is dispatched at this point).
+      budgetTxId = 'conv-' + crypto.randomUUID(); // assign the hoisted binding
+      {
+        const res = await reserveDailyBudget(env, est, budgetTxId);
+        if (!res.ok)
+          return json({ error: 'daily_budget_exhausted', note: res.note }, res.status || 503);
+      }
+
       // (8) PAYMENT VERIFY — challenge carries the EXACT tier price; the
       //     signed authorization must commit to exactly that amount.
       if (oversizedPaymentHeader) {
@@ -275,116 +306,79 @@ export default {
           statusNote: 'payment header exceeds 2048-byte limit',
         });
       }
-      v = await verifyPayment(env, request, { expectedAmount: tier.microUsdc });
+      v = await verifyPayment(env, request, {
+        expectedAmount: tier.microUsdc,
+        sizeBytes: file.size, // R46: price bound to the measured upload
+        // R54: settlement is PART of verification — ok:true only after a
+        // confirmed transfer AND a consumed nonce.
+        settle: async () => {
+          if (!cdpConfigured(env)) return { ok: false, reason: 'settlement_not_configured' };
+          const hdrB64 = request.headers.get('PAYMENT-SIGNATURE')
+            || request.headers.get('X-PAYMENT') || '';
+          const r = await cdpVerifyAndSettle(env, hdrB64,
+            'csv-parquet-stream-compressor', tier.microUsdc, tier.microUsdc);
+          if (r.ok !== true) return { ok: false, reason: r.reason, settledUnknown: r.settledUnknown };
+          if (!/^0x[0-9a-fA-F]{64}$/.test(String(r.settledTx || '')))
+            return { ok: false, reason: 'settle_tx_unproven' };
+          try { await consumeNonce(env, v0Nonce); }
+          catch (e) { return { ok: false, reason: 'nonce_consumption_failed' }; }
+          return { ok: true, settledTx: r.settledTx, settledFrom: r.settledFrom,
+            settledTo: r.settledTo, settledAmountUsdc: r.settledAmountUsdc,
+            settledNonce: r.settledNonce };
+        },
+        // R45: independent on-chain confirmation (payer/recipient/amount).
+        confirm: async (txHash, expected) => {
+          const rpc = env.BASE_RPC_ENDPOINT || 'https://mainnet.base.org';
+          const call = async (method, params) => {
+            const resp = await fetch(rpc, { method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) });
+            const j = await resp.json().catch(() => null);
+            return j && j.result !== undefined ? j.result : null;
+          };
+          const receipt = await call('eth_getTransactionReceipt', [txHash]);
+          if (!receipt || receipt.status !== '0x1') return { confirmed: false };
+          const USDC = '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913';
+          const TRANSFER = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+          const addr = (t) => '0x' + String(t).replace(/^0x/, '').slice(-40);
+          for (const log of receipt.logs || []) {
+            if (!log || !log.topics || !log.topics[0]) continue;
+            if (String(log.topics[0]).toLowerCase() !== TRANSFER) continue;
+            if (String(log.address || '').toLowerCase() !== USDC) continue;
+            if (addr(log.topics[1]).toLowerCase() !== String(expected.from).toLowerCase()) continue;
+            if (addr(log.topics[2]).toLowerCase() !== String(expected.to).toLowerCase()) continue;
+            let amount; try { amount = BigInt(log.data || '0x0'); } catch (e) { continue; }
+            if (amount < BigInt(expected.value)) continue;
+            return { confirmed: true };
+          }
+          return { confirmed: false };
+        },
+      });
       if (!v.ok) return v.failResponse;
+      // v.ok:true means the transfer settled AND the nonce was consumed
+      // (verifyPayment refuses to return ok without both).
+      paymentSettled = true;
 
-      // (8.1) CDP FACILITATOR SETTLEMENT — when configured, verify+settle the
-      //       signed authorization through Coinbase's facilitator. This is the
-      //       rail that makes the payment COLLECTIBLE and seeds Bazaar /
-      //       x402scan auto-indexing. A permanent rejection aborts the request
-      //       (402); a transient failure falls through to the offline path.
-      // R36: offline signature verification alone is NOT payment. If the
-      // facilitator is not configured, refuse the paid work — delivering here
-      // would hand out infrastructure that can never be collected.
-      if (v.ok && !cdpConfigured(env)) {
-        return json({ error: 'settlement_not_configured',
-          message: 'Payment settlement is not configured; refusing unpaid delivery.' }, 503);
-      }
-      if (v.ok && cdpConfigured(env)) {
-        const payHeaderB64 = request.headers.get('PAYMENT-SIGNATURE') || request.headers.get('X-PAYMENT') || '';
-        const cdpRes = await cdpVerifyAndSettle(env, payHeaderB64, 'csv-parquet-stream-compressor', tier.microUsdc, tier.microUsdc);
-        if (cdpRes.ok) {
-          v.settledTx = cdpRes.settledTx || null;
-        } else if (!cdpRes.retryable) {
-          // Genuine payment rejection — do NOT serve.
-          return json({ error: 'payment_rejected', reason: cdpRes.reason || 'facilitator_rejected' }, 402);
-        } else if (cdpRes.settledUnknown) {
-          // Settlement outcome UNKNOWN (may or may not have moved on-chain).
-          // Delivering now risks unpaid work; refusing is safe and correct.
-          return json({ error: 'settlement_unconfirmed', reason: cdpRes.reason || 'settlement_ambiguous' }, 503);
-        } else {
-          // Facilitator verifiably rejected with a transient error (e.g. its own
-          // outage) and NOTHING was submitted: the offline path stands.
-          v.settlePending = true;
-        }
-      }
-
-      // (9) UPSTREAM DISPATCH — client disconnect aborts the upstream job too
-      //     (we stop paying for abandoned work).
-      // Upstream gets the SANITIZED filename and the SANITIZED destination
-      // object (stringified) — raw client-supplied strings never leave here.
-      // The upload name must keep a whitelisted INPUT extension (.csv/.tsv/.txt)
-      // because the engine's sanitize_key whitelists input exts; '.parquet' is
-      // an OUTPUT extension and would 500 every paid internal-tier job.
+      // (9) UPSTREAM DISPATCH — build the outbound form and the timeout/
+      //     disconnect wiring the fetch below depends on.
       const uploadName = safeName.endsWith('.parquet')
         ? safeName.slice(0, -'.parquet'.length).replace(/\.(csv|tsv|txt)$/i, '') +
           (fname.match(/\.(csv|tsv|txt)$/) || ['.csv'])[0]
         : safeName;
       const outForm = new FormData();
       outForm.append('file', new File([file], uploadName), uploadName);
-      if (targetDestination) outForm.append('target_destination', JSON.stringify(dest));
+      if (dest && dest.endpoint_url) outForm.append('target_destination', JSON.stringify(dest));
+
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), tier.requiresUserDest ? 45 * 60 * 1000 : 10 * 60 * 1000);
+      const timeoutId = setTimeout(() => controller.abort(),
+        tier.requiresUserDest ? 45 * 60 * 1000 : 10 * 60 * 1000);
       const onAbort = () => controller.abort();
       if (request.signal) {
         if (request.signal.aborted) controller.abort();
         else request.signal.addEventListener('abort', onAbort, { once: true });
       }
-      //       // (8.4) RUNPOD BALANCE PREFLIGHT (SpendGuard) — after payment verify,
-      //     BEFORE budget reservation: an unverifiable upstream balance must
-      //     not strand a reservation (review R12).
-      {
-        const pb = await spendguard.preflightRunpodBalance(env);
-        if (!pb.ok) {
-          // OX-ALPHA (FIX-1): no reservation was made and no job will run, so
-          // release the nonce claim taken in verifyPayment exactly like every
-          // other post-payment failure path — the client keeps its payment
-          // retryable with the SAME signature once upstream balance recovers.
-          if (env.CONSUMED_TX_STORE && v && v.nonce) {
-            ctx.waitUntil((async () => {
-              try {
-                const id = env.CONSUMED_TX_STORE.idFromName('singleton');
-                const stub = env.CONSUMED_TX_STORE.get(id);
-                await stub.fetch('https://internal/release-nonce', {
-                  method: 'POST', headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ nonce: v.nonce }) });
-              } catch (_) {}
-            })());
-          }
-          return json({ error: 'upstream_balance_unavailable', note: pb.note }, pb.status);
-        }
-      }
 
-      // (8.5) ATOMIC BUDGET RESERVATION (SpendGuard DO) — payment already
-      //     verified; from here every exit path spends money, so the
-      //     reservation intentionally stands (no leak possible downstream).
-      budgetTxId = 'conv-' + crypto.randomUUID();
-      {
-        const res = await reserveDailyBudget(env, est, budgetTxId);
-        if (!res.ok) {
-          // OX-ALPHA: payment was ALREADY verified & accepted above (gate 8,
-          // v.ok === true) and no job will run. The nonce is deliberately
-          // UNBURNED / retry-eligible (consumption only happens after success,
-          // gate 10), so the client may safely retry with the SAME
-          // payment-signature once budget frees up. Never consume -> never
-          // burn on this path.
-          // R26b: release the DO nonce claim so retry with SAME signature works.
-          if (env.CONSUMED_TX_STORE && v && v.nonce) {
-            ctx.waitUntil((async () => {
-              try {
-                const id2 = env.CONSUMED_TX_STORE.idFromName('singleton');
-                const stub2 = env.CONSUMED_TX_STORE.get(id2);
-                await stub2.fetch('https://internal/release-nonce', {
-                  method: 'POST', headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ nonce: v.nonce }) });
-              } catch (_) {}
-            })());
-          }
-          return json({ error: 'daily_budget_exhausted', retry_nonce_unburned: true,
-            note: (res.note || '') + '; payment nonce UNBURNED and retry-eligible (same signature usable on retry).' }, res.status);
-        }
-      }
-
+      upstreamDispatched = true;
       let upstream;
       try {
         upstream = await fetch(env.RUNPOD_ENDPOINT_URL.replace(/\/$/, '') + '/v1/compress', {
@@ -405,7 +399,9 @@ export default {
                 // the eventual result shows a lower actual cost. Do NOT reconcile to
                 // $0 here.
                 // R26: release the nonce claim on timeout — client got no output.
-                if (env.CONSUMED_TX_STORE && v && v.nonce) {
+                // R55: a settled payment has been COLLECTED — never release its claim.
+        // Only an unsettled, undispatched claim may be released.
+        if (env.CONSUMED_TX_STORE && v && v.nonce && !paymentSettled && !upstreamDispatched) {
                   ctx.waitUntil((async () => {
                     try {
                       const id3 = env.CONSUMED_TX_STORE.idFromName('singleton');
@@ -423,9 +419,13 @@ export default {
               // bought — RELEASE the reservation by reconciling actual cost as $0.
               // (reconcile stays on THIS path ONLY.)
               // OX-ALPHA (FIX-3): unified ':reconcile' key on ALL reconciles.
-              ctx.waitUntil(reconcileDailyBudget(env, budgetTxId + ':reconcile', 0).catch(() => {}));
+              // R56: dispatch was ATTEMPTED — compute may have started, so
+              // reconcile to the reserved estimate, never $0.
+              ctx.waitUntil(reconcileDailyBudget(env, budgetTxId + ':reconcile', est).catch(() => {}))
         // R25: release the pre-dispatch nonce claim — no compute was bought/delivered.
-        if (env.CONSUMED_TX_STORE && v && v.nonce) {
+        // R55: a settled payment has been COLLECTED — never release its claim.
+        // Only an unsettled, undispatched claim may be released.
+        if (env.CONSUMED_TX_STORE && v && v.nonce && !paymentSettled && !upstreamDispatched) {
           ctx.waitUntil((async () => {
             try {
               const id = env.CONSUMED_TX_STORE.idFromName('singleton');
@@ -448,7 +448,9 @@ export default {
         // daily ledger). OX-ALPHA (FIX-3): unified ':reconcile' key.
         ctx.waitUntil(reconcileDailyBudget(env, budgetTxId + ':reconcile', 0).catch(() => {}));
         // R25: release the pre-dispatch nonce claim — no compute was bought/delivered.
-        if (env.CONSUMED_TX_STORE && v && v.nonce) {
+        // R55: a settled payment has been COLLECTED — never release its claim.
+        // Only an unsettled, undispatched claim may be released.
+        if (env.CONSUMED_TX_STORE && v && v.nonce && !paymentSettled && !upstreamDispatched) {
           ctx.waitUntil((async () => {
             try {
               const id = env.CONSUMED_TX_STORE.idFromName('singleton');
@@ -475,7 +477,9 @@ export default {
         // OX-ALPHA (FIX-3): unified ':reconcile' key on ALL reconciles.
         ctx.waitUntil(reconcileDailyBudget(env, budgetTxId + ':reconcile', 0).catch(() => {}));
         // R25: release the pre-dispatch nonce claim — no compute was bought/delivered.
-        if (env.CONSUMED_TX_STORE && v && v.nonce) {
+        // R55: a settled payment has been COLLECTED — never release its claim.
+        // Only an unsettled, undispatched claim may be released.
+        if (env.CONSUMED_TX_STORE && v && v.nonce && !paymentSettled && !upstreamDispatched) {
           ctx.waitUntil((async () => {
             try {
               const id = env.CONSUMED_TX_STORE.idFromName('singleton');
@@ -543,12 +547,14 @@ export default {
       // FAIL-CLOSED catch-all: an internal error never becomes a free job.
       // R26c/R29: release nonce claim AND reconcile budget reservation on errors.
       try {
-        if (typeof budgetTxId === 'string' && budgetTxId) {
+        if (typeof budgetTxId === 'string' && budgetTxId && !upstreamDispatched) {
           ctx.waitUntil(reconcileDailyBudget(env, budgetTxId + ':reconcile', 0).catch(() => {}));
         }
       } catch (_) {}
       try {
-        if (env.CONSUMED_TX_STORE && typeof v !== 'undefined' && v && v.nonce) {
+        // R55: a settled payment was COLLECTED — never release it.
+        if (env.CONSUMED_TX_STORE && typeof v !== 'undefined' && v && v.nonce
+            && !paymentSettled && !upstreamDispatched) {
           const id2 = env.CONSUMED_TX_STORE.idFromName('singleton');
           const stub2 = env.CONSUMED_TX_STORE.get(id2);
           await stub2.fetch('https://internal/release-nonce', {
@@ -556,6 +562,7 @@ export default {
             body: JSON.stringify({ nonce: v.nonce }) });
         }
       } catch (_) {}
+      console.error('[gateway] internal_error:', (e && e.stack) || e);
       return json({ error: 'internal_error' }, 500);
     }
   },
