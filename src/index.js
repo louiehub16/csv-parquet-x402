@@ -390,17 +390,42 @@ export default {
                   'proof for', v.nonce, '— leaving the claim retryable');
                 return false;
               }
+              // R38: the payout happened, but the DURABLE record is the DO write.
+              // Its response was never checked, so a DO 5xx/throw still reported
+              // the refund complete and left the KV mirror claiming 'refunded' --
+              // with no durable record, so no operator sweep could ever retry it.
+              // Only acknowledge completion once the DO confirms it.
+              let markOk = false;
+              try {
+                const mId = env.CONSUMED_TX_STORE.idFromName('singleton');
+                const mRes = await env.CONSUMED_TX_STORE.get(mId).fetch(
+                  'https://internal/mark-refunded', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ nonce: v.nonce }) });
+                const mData = mRes && mRes.ok
+                  ? await mRes.clone().json().catch(() => null) : null;
+                markOk = !!(mRes && mRes.ok && mData && mData.ok === true);
+                if (!markOk) {
+                  console.error('[gateway] mark-refunded not acknowledged for', v.nonce,
+                    '— leaving the refund retryable');
+                }
+              } catch (e) {
+                console.error('[gateway] mark-refunded failed for', v.nonce,
+                  '— leaving the refund retryable');
+              }
+              if (!markOk) {
+                // Keep the claim retryable: the payout proof is recorded for the
+                // operator sweep, but the refund is not reported as complete.
+                record.status = 'payout_sent_unconfirmed';
+                await env.SECURITY_KV.put(refKey, JSON.stringify(record),
+                  { expirationTtl: 604800 }).catch(() => {});
+                return false;
+              }
               record.status = 'refunded';
               record.refundProof = txProof ? String(rb.txHash || rb.transaction || rb.refund_tx)
                 : (isIdemReplay ? 'idempotent_replay' : 'explicit_success');
               await env.SECURITY_KV.put(refKey, JSON.stringify(record),
                 { expirationTtl: 604800 }).catch(() => {});
-              try {
-                const mId = env.CONSUMED_TX_STORE.idFromName('singleton');
-                await env.CONSUMED_TX_STORE.get(mId).fetch('https://internal/mark-refunded', {
-                  method: 'POST', headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ nonce: v.nonce }) });
-              } catch (_) {}
               return true;
             }
           } catch (e) { /* stays queued for the sweep */ }
