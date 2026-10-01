@@ -81,6 +81,92 @@ def log_diagnostic(where: str, err) -> None:
         pass
 
 
+# R26: SSRF guard for a caller-supplied S3 endpoint. The gateway filters the
+# URL syntactically, but THIS process is the one that actually opens the socket,
+# so it must validate the host AND the addresses it resolves to. Crucially this
+# covers IPv4-mapped IPv6 forms such as [::ffff:127.0.0.1], which bypass a
+# dotted-quad-only check and otherwise reach loopback/private infrastructure.
+import ipaddress
+import socket
+from urllib.parse import urlparse
+
+
+def _forbidden_host(host: str) -> str:
+    """Return a reason string if the host is unsafe to dial, else ''."""
+    h = (host or "").strip().lower().strip("[]")
+    if not h:
+        return "empty host"
+    if h in ("localhost",) or h.endswith((".internal", ".local", ".localhost")):
+        return "private hostname"
+    # Alternate integer encodings a dialer normalises into an IPv4 address:
+    # '2130706433' == 127.0.0.1, '0x7f000001' == 127.0.0.1. ipaddress cannot
+    # parse these, so they are rejected before any resolution is attempted.
+    if h.isdigit() or (h.startswith("0x") and all(c in "0123456789abcdefABCDEF"
+                                                  for c in h[2:]) and len(h) > 2):
+        return "non-decimal-safe integer host"
+    if h == "metadata.google.internal" or h.startswith("169.254."):
+        return "cloud metadata"
+    # Any IP literal (v4, v6, or v4-mapped v6) is checked in its NUMERIC form.
+    try:
+        ip = ipaddress.ip_address(h)
+    except ValueError:
+        return ""            # not a literal -> resolved below
+    if ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_reserved \
+            or ip.is_multicast or ip.is_unspecified:
+        return "non-public IP"
+    # ::ffff:127.0.0.1 and friends collapse to the embedded IPv4 address.
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None and (mapped.is_loopback or mapped.is_private
+                               or mapped.is_link_local):
+        return "IPv4-mapped non-public IP"
+    return ""
+
+
+def _resolve_all_public(host: str):
+    """Resolve host and ensure EVERY address is publicly routable (anti-rebind).
+
+    A resolution FAILURE is NOT treated as a rejection: a transient DNS failure
+    must not lock a customer out of their own bucket (and the request will fail
+    naturally on connect if the host is truly dead). Only a successful
+    resolution that PROVES a non-public target is refused."""
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception:
+        return ""              # cannot prove anything -> allow, let connect fail
+    if not infos:
+        return ""
+    for info in infos:
+        addr = info[4][0]
+        try:
+            ip = ipaddress.ip_address(addr.split("%")[0])
+        except ValueError:
+            return "unparsable resolved address"
+        if ip.is_loopback or ip.is_private or ip.is_link_local or \
+                ip.is_reserved or ip.is_multicast or ip.is_unspecified:
+            return "host resolves to a non-public address"
+        mapped = getattr(ip, "ipv4_mapped", None)
+        if mapped is not None and (mapped.is_loopback or mapped.is_private
+                                   or mapped.is_link_local):
+            return "host resolves to an IPv4-mapped non-public address"
+    return ""
+
+
+def validate_endpoint_url(url: str) -> str:
+    """Return '' if the endpoint is an acceptable public HTTPS S3 endpoint."""
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return "unparsable endpoint_url"
+    if parsed.scheme != "https":
+        return "endpoint_url must be https"
+    if not parsed.hostname:
+        return "endpoint_url has no host"
+    why = _forbidden_host(parsed.hostname)
+    if why:
+        return why
+    return _resolve_all_public(parsed.hostname)
+
+
 DELIMS = (",", ";", "\t")
 
 
@@ -264,6 +350,13 @@ async def compress(file: UploadFile, target_destination: str = Form(None)):
                     "message": f"target_destination missing fields: {missing}"})
 
         if custom:
+            # R26: validate BEFORE any socket is opened (the preflight below
+            # would otherwise happily dial 127.0.0.1 or 169.254.169.254).
+            why = validate_endpoint_url(custom["endpoint_url"])
+            if why:
+                return JSONResponse(status_code=400, content={
+                    "status": "error",
+                    "message": f"target_destination endpoint rejected: {why}."})
             endpoint = custom["endpoint_url"]
             ak, sk = custom["aws_access_key_id"], custom["aws_secret_access_key"]
             bucket = custom["bucket_name"]

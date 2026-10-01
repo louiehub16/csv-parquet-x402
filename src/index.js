@@ -7,6 +7,9 @@ import {
 } from './x402.js';
 // CDP facilitator adapter (settlement rail) — installed for auto-indexing + collectibility.
 import { cdpConfigured, cdpVerifyAndSettle } from './cdp.js';
+// R26: one EIP-712 verification implementation, reused by result retrieval --
+// a header's nonce is public on-chain, so the signature must be re-checked.
+import { recoverAuthorizationSigner } from './authz_sign.js';
 // SpendGuard (R12.5) — financial guard rails + atomic budget ledger (reviewer-hardened
 // through 12 rounds on the docker-on-tap project; see REVIEW_LEDGER.md).
 import * as spendguard from './spendguard.js';
@@ -53,6 +56,32 @@ manifest carrying the exact micro-USDC price computed from your file's byte size
 <a style="color:#79c0ff" href="/.well-known/x402.json">/.well-known/x402.json</a> ·
 <a style="color:#79c0ff" href="/openapi.json">/openapi.json</a> ·
 <a style="color:#79c0ff" href="/mcp/config">/mcp/config</a></p></body></html>`;
+
+// R26: recover the signer for a parsed authorization (null when unverifiable).
+function recoverPayer(auth) {
+  try { return recoverAuthorizationSigner(auth, auth.signature); }
+  catch (e) { return null; }
+}
+
+// R26: parse the full authorization out of a base64url PAYMENT-SIGNATURE header.
+// The nonce is public on-chain, so it is NOT sufficient as proof of payment --
+// callers must also recover the signer and compare it to the receipt's payer.
+function parseAuthHeader(hdr) {
+  try {
+    const dec = JSON.parse(atob(String(hdr || '').replace(/-/g, '+').replace(/_/g, '/')
+      + '==='.slice(0, (4 - String(hdr).length % 4) % 4)));
+    const a = dec && dec.payload && dec.payload.authorization;
+    if (!a || !a.from || !a.nonce) return null;
+    const s = dec.payload.signature;
+    return {
+      from: String(a.from),
+      nonce: String(a.nonce).replace(/^0x/, '').toLowerCase(),
+      to: a.to, value: a.value, validAfter: a.validAfter, validBefore: a.validBefore,
+      signature: s || null,
+      domain: dec.payload.domain || (dec.payload && dec.payload.domain) || null,
+    };
+  } catch (e) { return null; }
+}
 
 // Extract the authorization nonce from a base64url PAYMENT-SIGNATURE header.
 function nonceFromHeader(hdr) {
@@ -125,8 +154,14 @@ export default {
           return json({ error: 'payment_proof_required',
             message: 'Send the PAYMENT-SIGNATURE header used for the paid conversion.' }, 402);
         }
-        const nonce = nonceFromHeader(proof);
-        if (!nonce) return json({ error: 'bad_payment_header' }, 400);
+        // R26: the nonce is PUBLIC -- it is indexed on-chain in the
+        // AuthorizationUsed event, so anyone observing a settlement can read it
+        // and forge a header naming it. A nonce alone is therefore NOT proof of
+        // payment. The header's EIP-712 signature is re-verified here and the
+        // recovered signer must equal the payer on the receipt.
+        const parsedAuth = parseAuthHeader(proof);
+        if (!parsedAuth) return json({ error: 'bad_payment_header' }, 400);
+        const nonce = parsedAuth.nonce;
         const receiptRaw = await env.SECURITY_KV.get('result:' + nonce)
           .catch(() => null);
         if (!receiptRaw) {
@@ -137,6 +172,14 @@ export default {
         try { receipt = JSON.parse(receiptRaw); } catch (e) { receipt = null; }
         if (!receipt || receipt.nonce !== nonce) {
           return json({ error: 'result_not_found' }, 404);
+        }
+        // The signature must actually recover to the payer who paid for THIS
+        // receipt. A forged header with someone else's public nonce fails here.
+        const recovered = recoverPayer(parsedAuth);
+        if (!recovered || !receipt.payer ||
+            recovered.toLowerCase() !== String(receipt.payer).toLowerCase()) {
+          return json({ error: 'payment_does_not_match_receipt',
+            message: 'This authorization did not pay for the requested result.' }, 403);
         }
         // The caller may pass a ref, but the RECEIPT is authoritative: it can
         // only ever expose the object that THIS paid nonce actually produced.
@@ -911,8 +954,19 @@ export default {
           bucket: parsed.output_bucket || null, key: parsed.output_key,
           settledTx: v.settledTx || null, at: Date.now(),
         };
-        ctx.waitUntil(env.SECURITY_KV.put('result:' + v.nonce,
-          JSON.stringify(receipt), { expirationTtl: 604800 }).catch(() => {}));
+        // R26: AWAIT the receipt, not waitUntil. Returning success while the
+        // write is still in flight let a customer fetch their result
+        // immediately and get 404 for a conversion they had already paid for.
+        // If persistence fails the payer must not be told it succeeded.
+        try {
+          await env.SECURITY_KV.put('result:' + v.nonce,
+            JSON.stringify(receipt), { expirationTtl: 604800 });
+        } catch (e) {
+          console.error('[gateway] result receipt write failed for', v.nonce);
+          const refundedR = await recordRefund('result_receipt_write_failed');
+          return json({ error: 'result_persistence_failed',
+            refund: refundedR ? 'completed' : 'required' }, 502);
+        }
       }
       if (v && v.settledTx) body.settled_tx = v.settledTx;
       else if (v && v.settlePending) body.settle_pending = true;
@@ -985,8 +1039,11 @@ export default {
         }
       } catch (_) {}
       console.error('[gateway] internal_error:', (e && e.stack) || e);
+      // R26: recordRefund() returning true means the refund was EXECUTED and
+      // durably recorded, so the honest label is 'completed'. Reporting
+      // 'queued' re-introduced a promise the operator sweep may never fulfil.
       return json({ error: 'internal_error',
-        refund: paymentSettled ? (refundQueued ? 'queued' : 'required') : undefined }, 500);
+        refund: paymentSettled ? (refundQueued ? 'completed' : 'required') : undefined }, 500);
     }
   },
 };

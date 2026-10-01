@@ -8,6 +8,10 @@ import {
   recover, hexToBigInt, bigIntToBytes32, bytesToBigInt,
 } from './_secp256k1.js';
 
+// R26: re-export the primitives so every caller (the money path and the
+// result-retrieval path) shares ONE signature-verification implementation.
+export { recover };
+
 export const USDC_ON_BASE = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
 export const CHAIN_ID = 8453;
 const NETWORK = 'eip155:8453';
