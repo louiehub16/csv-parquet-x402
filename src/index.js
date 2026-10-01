@@ -895,11 +895,14 @@ export default {
       // R44: the output key was derived ONLY from the sanitized filename, so two
       // concurrent jobs uploading `data.csv` targeted the SAME object -- one
       // silently overwrote the other, and a payer could be served another
-      // customer's file. Give every job a unique stem built from the paid
-      // authorization nonce, so keys are collision-free across tenants and
-      // retries. The nonce is unique per payment (it is burned after success).
-      const jobStem = (v && v.nonce ? String(v.nonce).replace(/^0x/, '').slice(0, 16)
-                                      : crypto.randomUUID().replace(/-/g, '').slice(0, 16));
+      // customer's file. Give every job a unique stem so keys are collision-free
+      // across tenants and retries.
+      // R55: the stem was the first 16 hex chars of the PAYER-CONTROLLED nonce --
+      // only 64 bits, and chosen by the payer, so two authorizations sharing a
+      // 64-bit prefix would collide and one job would overwrite the other. Use a
+      // GATEWAY-GENERATED 128-bit id instead: unguessable by the payer, and far
+      // beyond any realistic collision range.
+      const jobStem = crypto.randomUUID().replace(/-/g, '');
       const baseStem = safeName.endsWith('.parquet')
         ? safeName.slice(0, -'.parquet'.length).replace(/\.(csv|tsv|txt)$/i, '')
         : safeName.replace(/\.(csv|tsv|txt)$/i, '');

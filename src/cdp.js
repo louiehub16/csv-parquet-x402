@@ -342,7 +342,10 @@ export async function cdpVerifyAndSettle(env, paymentHeaderB64, resourceName, mi
         // R32: a permanent verify rejection happens BEFORE anything is
         // submitted, so nothing settled. Say so explicitly or the gateway keeps
         // the nonce claim and locks the payer out of this authorization.
-        definitelyNotSubmitted: perm === true,
+        // R54: VERIFY stage -- /settle was never called, so nothing was
+        // submitted regardless of status or wording.
+        definitelyNotSubmitted: true,
+        stage: 'verify',
         reason: safeReason(errBody, `verify_http_${verifyRes.status}`),
       };
     }
@@ -354,16 +357,26 @@ export async function cdpVerifyAndSettle(env, paymentHeaderB64, resourceName, mi
       // never released. The returned reason stays sanitized (no text leakage).
       const rawReason = reasonString(vData);
       const isRej = isRejectionReason(rawReason);
+      // R54: VERIFY stage -- /settle was never called, so NOTHING was submitted.
+      // Without this the caller saw an ambiguous outcome and could schedule a
+      // REFUND for an authorization the payer never paid for, paying money back
+      // for work that cost nothing. Every verify-stage failure is therefore
+      // definitelyNotSubmitted, whatever the wording.
       return { mode: 'cdp', ok: false, retryable: !isRej,
-        // A payment-phase rejection at verify means the authorization is
-        // unusable and NOTHING was submitted -- release the nonce claim.
-        definitelyNotSubmitted: isRej === true,
+        definitelyNotSubmitted: true, stage: 'verify',
         reason: safeReason(vData, 'verify_failed') };
     }
 
     // ---- STEP 2: SETTLE ----
     const jwtS = await buildCdpJwt(env, 'POST', '/platform/v2/x402/settle');
-    if (!jwtS) return { mode: 'cdp', ok: false, retryable: true };
+    // R54: we could not even build the settle request, so NOTHING was submitted.
+    // Reporting this as settled-unknown could schedule a refund for an
+    // authorization the payer never paid for.
+    if (!jwtS) {
+      return { mode: 'cdp', ok: false, retryable: true,
+        definitelyNotSubmitted: true, stage: 'settle-preflight',
+        reason: 'settle_jwt_unavailable' };
+    }
     const settleRes = await fetch(`${CDP_BASE}/settle`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${jwtS}`, 'Content-Type': 'application/json' },

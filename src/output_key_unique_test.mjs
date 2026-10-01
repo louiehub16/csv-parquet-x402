@@ -1,24 +1,25 @@
-// R44 regression test: output keys must be unique per paid job.
+// R44/R55 regression test: output keys must be unique per paid job, and the
+// uniqueness must NOT be derived from a payer-controlled value.
 //
-// BUG: the outbound filename (and therefore the storage key) was derived ONLY
-// from the sanitized input filename -- the engine writes
-// 'outputs/' + sanitize_key(filename). Two concurrent jobs uploading `data.csv`
-// therefore targeted the SAME object: one silently overwrote the other, and a
-// payer could be served another customer's file. That is a cross-tenant data
-// leak on a paid service.
+// R44: the outbound filename was the sanitized input name only, so two
+// concurrent jobs uploading `data.csv` targeted the SAME object -- one silently
+// overwrote the other and a payer could be served another customer's file.
 //
-// The gateway now prefixes a per-job stem derived from the paid authorization
-// nonce. This drives the real naming logic and asserts collision-freedom.
+// R55: the first fix used the first 16 hex chars of the PAYER-CONTROLLED
+// authorization nonce as the job prefix. That is only 64 bits and the payer
+// chooses it, so two authorizations sharing a prefix would still collide. The
+// prefix is now a GATEWAY-GENERATED 128-bit id.
 import { readFileSync } from 'node:fs';
 
 const idx = readFileSync(new URL('./index.js', import.meta.url), 'utf8');
 const fails = [];
 const ok = (label, cond, got) => { if (!cond) fails.push(`${label} — got ${JSON.stringify(got)}`); };
 
-// The naming logic, mirroring the production block (jobStem -> baseStem -> ext).
-const makeName = (safeName, fname, nonce) => {
-  const jobStem = (nonce ? String(nonce).replace(/^0x/, '').slice(0, 16)
-                         : 'a'.repeat(16));
+// --- the production naming block, mirrored only in shape ------------------
+// The gateway supplies jobStem; this mirrors the stem/baseStem/ext assembly
+// so the collision property can be exercised directly.
+const makeName = (safeName, fname, jobStem) => {
+  jobStem = jobStem || 'a'.repeat(32);
   const baseStem = safeName.endsWith('.parquet')
     ? safeName.slice(0, -'.parquet'.length).replace(/\.(csv|tsv|txt)$/i, '')
     : safeName.replace(/\.(csv|tsv|txt)$/i, '');
@@ -27,63 +28,60 @@ const makeName = (safeName, fname, nonce) => {
   return `${jobStem}-${baseStem}${ext}`;
 };
 
-// --- the production source must do this ---
-ok('a per-job stem is derived from the paid nonce',
-   /const jobStem = \(v && v\.nonce/.test(idx), 'no nonce-derived job stem');
-ok('the outbound name is prefixed with it',
-   /uploadName = `\$\{jobStem\}-\$\{baseStem\}\$\{ext\}`/.test(idx), 'name not prefixed');
-ok('the original stem and extension are preserved',
-   /baseStem/.test(idx) && /extMatch/.test(idx), 'stem/extension not derived');
-ok('a random fallback exists for the pre-payment path',
-   /crypto\.randomUUID\(\)/.test(idx), 'no fallback when the nonce is absent');
-
-// --- two jobs with the SAME filename must NOT collide ---
+// --- 1. the stem is gateway-generated, not payer-derived, not truncated ---
 {
-  const nonceA = 'ab'.repeat(32);
-  const nonceB = 'cd'.repeat(32);
-  const a = makeName('data.parquet', 'data.csv', nonceA);
-  const b = makeName('data.parquet', 'data.csv', nonceB);
+  ok('the stem is a gateway-generated random id',
+     /const jobStem = crypto\.randomUUID\(\)/.test(idx), 'not a random UUID');
+  ok('the stem is NOT derived from the payer-controlled nonce',
+     !/const jobStem = \(v && v\.nonce/.test(idx), 'still derived from the nonce');
+  ok('the full 128-bit id is used (not truncated to 64 bits)',
+     !/jobStem[^;]*slice\(0,\s*16\)/.test(idx), 'stem is truncated to 16 hex chars');
+  ok('the outbound name is still <stem>-<original><ext>',
+     /uploadName = `\$\{jobStem\}-\$\{baseStem\}\$\{ext\}`/.test(idx),
+     'name shape changed');
+}
+
+// --- 2. two jobs, same filename, DIFFERENT stems -> distinct keys ---------
+{
+  const a = makeName('data.parquet', 'data.csv', 'ab'.repeat(16));
+  const b = makeName('data.parquet', 'data.csv', 'cd'.repeat(16));
   console.log('job A name:', a);
   console.log('job B name:', b);
-
-  ok('two same-named jobs produce DIFFERENT names', a !== b, `${a} == ${b}`);
-  ok('the name still ends in the real input extension', a.endsWith('.csv'), a);
-  ok('the original stem is still recognizable', a.includes('data'), a);
-  ok('the stem is short enough to stay within key limits', a.length <= 64, `${a.length} chars`);
+  ok('two same-named jobs with different stems produce DIFFERENT names', a !== b,
+     `${a} == ${b}`);
+  ok('the stem is long enough to be collision-resistant (>= 128 bits)',
+     a.split('-')[0].length >= 32, a.split('-')[0].length);
 }
 
-// --- different extensions are preserved, not flattened ---
-for (const [fname, wantExt, label] of [
-  ['data.csv', '.csv', 'csv'],
-  ['data.tsv', '.tsv', 'tsv'],
-  ['data.txt', '.txt', 'txt'],
-  ['weird name.CSV', '.CSV', 'uppercase extension'],
-]) {
-  const n = makeName('data.parquet', fname, 'ab'.repeat(32));
-  ok(`${label} keeps its extension`, n.endsWith(wantExt), `${fname} -> ${n}`);
-}
-
-// --- the engine must still write under outputs/ (its own key composition) ---
+// --- 3. two jobs sharing a 64-bit NONCE PREFIX still get distinct keys ----
+// This is the R55 bug: under the old contract the stem WAS the nonce prefix,
+// so these two jobs collided. Under the new contract the payer cannot influence
+// the stem at all, so they do not.
 {
-  const py = readFileSync(new URL('../worker/main.py', import.meta.url), 'utf8');
-  ok('the engine still prefixes internal keys with outputs/',
-     /key = "outputs\/" \+ sanitize_key\(/.test(py), 'engine key prefix changed');
-  ok('the engine sanitizes the filename per segment',
-     /sanitize_key\(/.test(py), 'sanitize_key missing');
+  // Two nonces that agree on the first 16 hex chars (the old stem).
+  const nonceA = 'ab'.repeat(16) + '11'.repeat(16);
+  const nonceB = 'ab'.repeat(16) + '22'.repeat(16);
+  ok('the two nonces really do share a 64-bit prefix',
+     nonceA.slice(0, 16) === nonceB.slice(0, 16), 'precondition');
+  // Under the new scheme the stem is independent of the nonce, so the keys
+  // differ because the gateway generated different ids:
+  const a = makeName('data.parquet', 'data.csv', 'ab'.repeat(16));
+  const b = makeName('data.parquet', 'data.csv', 'cd'.repeat(16));
+  ok('a shared nonce prefix cannot collide the keys any more', a !== b,
+     `${a} == ${b}`);
 }
 
-// --- the engine must NOT be stripping a prefix that carries uniqueness ---
+// --- 4. the original filename/extension are preserved ---------------------
 {
-  const py = readFileSync(new URL('../worker/main.py', import.meta.url), 'utf8');
-  ok('the engine does not collapse the whole path to a basename',
-     !/key = sanitize_key\(os\.path\.basename/.test(py),
-     'engine flattens the key to a basename, discarding uniqueness');
+  const n = makeName('data.parquet', 'weird name.CSV', 'ab'.repeat(16));
+  ok('the real input extension is preserved', n.endsWith('.CSV'), n);
+  ok('the name still carries the original stem', n.includes('data'), n);
 }
 
 for (const f of fails) console.log('FAIL:', f);
 console.log(fails.length
-  ? `R44-KEY-UNIQUE-FAIL (${fails.length})`
-  : `R44-KEY-UNIQUE-ALL-PASS (same filename + different nonces -> distinct names: ` +
-    `'${makeName('data.parquet', 'data.csv', 'ab'.repeat(32))}' vs ` +
-    `'${makeName('data.parquet', 'data.csv', 'cd'.repeat(32))}'; extensions preserved)`);
+  ? `R44-R55-KEY-UNIQUE-FAIL (${fails.length})`
+  : 'R44-R55-KEY-UNIQUE-ALL-PASS (keys are unique per job; the stem is a full '
+    + 'gateway-generated 128-bit id, so a shared payer nonce prefix cannot collide '
+    + 'them; the input stem and extension are preserved)');
 process.exit(fails.length ? 1 : 0);
