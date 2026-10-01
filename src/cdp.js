@@ -194,14 +194,25 @@ function isPermanentRejection(status, errBody) {
     // transfer very likely DID move (this is a retry of a payment that already
     // completed), so classifying it as definitely-not-submitted released the
     // nonce and scheduled no refund -- the payer paid and got nothing.
-    // Only a 409 that names a genuinely unusable authorization (a different
-    // payer/amount/recipient conflict) is a clean "nothing moved" answer.
+    //
+    // R56: the previous version returned true for EVERY other 409, so an
+    // unclassified conflict (busy, internal, a transient retryable error) was
+    // treated as a clean "nothing moved" verdict too, which releases the nonce
+    // and lets a possibly-collected payment be retried. Only an EXPLICIT
+    // conflict naming the authorization/payment/amount/recipient is a clean
+    // rejection; anything we cannot classify is ambiguous and takes the refund
+    // path instead.
     const r = reasonString(errBody);
     if (/already.{0,40}(?:settled|used|consumed|complete)/i.test(r) &&
         !/conflict|does not match|different|mismatch/i.test(r)) {
-      return false;   // ambiguous: treat as settled-unknown -> refund path
+      return false;   // ambiguous: settled-unknown -> refund path
     }
-    return true;
+    const namesAuth = /authorization|nonce|payment|amount|recipient|payer|from|to\b|signature/i;
+    const conflictWording = /does not match|different|mismatch|not found|no such|unknown|conflict/i;
+    if (conflictWording.test(r) && namesAuth.test(r)) {
+      return true;    // an explicit conflict about THIS authorization
+    }
+    return false;     // unclassified 409 -> ambiguous, never a clean verdict
   }
   if (status === 400 || status === 422) {
     const r = reasonString(errBody);

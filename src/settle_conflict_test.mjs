@@ -38,9 +38,29 @@ const ok = (label, cond, got) => { if (!cond) fails.push(`${label} — got ${JSO
   ok('409 real conflict remains permanent (nothing moved)',
      isPerm(409, conflict) === true, isPerm(409, conflict));
 
-  // Unrelated 409 wording with no payment signal stays permanent (prior behaviour).
-  ok('409 with no settled/consumed wording stays permanent',
-     isPerm(409, { error: 'conflict' }) === true, isPerm(409, { error: 'conflict' }));
+  // R56: an UNCLASSIFIED 409 (busy / internal / transient) must be ambiguous.
+  // Treating it as a clean "nothing moved" verdict releases the nonce and lets a
+  // possibly-collected payment be retried -- a payer could be charged twice.
+  for (const [body, label] of [
+    [{ error: 'conflict' }, 'bare "conflict"'],
+    [{ error: 'busy, try again' }, 'busy/transient'],
+    [{ error: 'internal error' }, 'internal error'],
+    [{}, 'empty body'],
+  ]) {
+    const ambiguous = isPerm(409, body) === false;
+    ok(`409 ${label} is NOT a clean rejection`, ambiguous, isPerm(409, body));
+  }
+  // ...but an EXPLICIT authorization conflict still is.
+  ok('409 explicit mismatch is still a clean rejection',
+     isPerm(409, { error: 'payment does not match the submitted amount' }) === true,
+     isPerm(409, { error: 'payment does not match the submitted amount' }));
+
+  // R56: the old assertion here ("a bare conflict stays permanent") was WRONG.
+  // A bare "conflict" does not establish that nothing moved, so it must NOT be a
+  // clean rejection -- that would release the nonce and let a possibly-collected
+  // payment be retried. Only an EXPLICIT authorization mismatch is clean.
+  ok('409 bare "conflict" is ambiguous, not a clean rejection',
+     isPerm(409, { error: 'conflict' }) === false, isPerm(409, { error: 'conflict' }));
 
   // Pre-existing classifications must not regress.
   ok('402 is still permanent', isPerm(402, {}) === true, isPerm(402, {}));
