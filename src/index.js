@@ -1047,6 +1047,26 @@ export default {
         // R30: refuse a key that could escape its prefix. The engine already
         // sanitizes; this is defence in depth, not a rewrite.
         const receiptKey = String(receipt.key || '');
+        // R41: validate BOTH identifiers. Only the key was checked, so a
+        // compromised engine could place a query-string or credential-looking
+        // value in output_bucket, which result retrieval later returns to the
+        // client. plainPath() admits only [A-Za-z0-9._\-/:] with no query or
+        // credential characters, and both values are re-derived from it so what
+        // is stored is exactly what was validated.
+        const safeBucket = plainPath(String(receipt.bucket || ''), 200);
+        const safeKeyPath = plainPath(receiptKey, 200);
+        // plainPath() validates SHAPE only, so a credential-shaped identifier
+        // ('AKIA...', 'my-token-bucket') is shape-valid. The stored value is
+        // returned verbatim to the paying client, so screen it for credential
+        // material using the same pattern already applied to relayed fields.
+        const identifierHasSecret = (s) => !!s && SECRETS.test(s);
+        if (identifierHasSecret(safeBucket) || identifierHasSecret(safeKeyPath)) {
+          console.error('[gateway] engine returned a credential-shaped output identifier for',
+            v.nonce);
+          const refundedS = await recordRefund('engine_unsafe_output_identifier');
+          return json({ error: 'engine_result_incomplete',
+            refund: refundedS ? 'completed' : 'required' }, 502);
+        }
         if (!receiptKey || receiptKey.startsWith('/') ||
             receiptKey.split('/').some((seg) => seg === '..' || seg === '.')) {
           console.error('[gateway] engine returned an unsafe output_key for', v.nonce);
@@ -1054,6 +1074,17 @@ export default {
           return json({ error: 'engine_result_incomplete',
             refund: refundedK ? 'completed' : 'required' }, 502);
         }
+        if (!safeBucket || safeBucket === '[invalid]' ||
+            !safeKeyPath || safeKeyPath === '[invalid]') {
+          console.error('[gateway] engine returned an unplain output identifier for',
+            v.nonce);
+          const refundedB = await recordRefund('engine_unsafe_output_identifier');
+          return json({ error: 'engine_result_incomplete',
+            refund: refundedB ? 'completed' : 'required' }, 502);
+        }
+        // Store exactly what was validated.
+        receipt.bucket = safeBucket;
+        receipt.key = safeKeyPath;
         try {
           await env.SECURITY_KV.put('result:' + v.nonce,
             JSON.stringify(receipt), { expirationTtl: 604800 });
