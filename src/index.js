@@ -912,8 +912,19 @@ export default {
         else request.signal.addEventListener('abort', onAbort, { once: true });
       }
 
+      // R49: dispatch was ATTEMPTED. This is NOT the same as "compute may have
+      // started" -- the cleanup paths below need to distinguish them, and using
+      // one flag for both made their release conditions permanently false (the
+      // flag is set here, a few lines above each of them, so `!upstreamDispatched`
+      // could never be true there and the nonce claim was never released).
+      //
+      // `upstreamAccepted` is set only once the engine has RESPONDED, which is
+      // the point at which compute is known to have run. A transport error or a
+      // timeout before any response means the request may not have started, so
+      // the payer keeps a retryable authorization instead of being locked out.
       upstreamDispatched = true;
       let upstream;
+      let upstreamAccepted = false;
       try {
         upstream = await fetch(env.RUNPOD_ENDPOINT_URL.replace(/\/$/, '') + '/v1/compress', {
           method: 'POST',
@@ -921,6 +932,9 @@ export default {
           signal: controller.signal,
           headers: { Authorization: 'Bearer ' + env.RUNPOD_API_KEY },
         });
+        // R49: the engine RESPONDED, so compute is known to have run. Only now
+        // is it unsafe to release the payer's authorization.
+        upstreamAccepted = true;
       } catch (e) {
               clearTimeout(timeoutId);
               if (request.signal) request.signal.removeEventListener('abort', onAbort);
@@ -934,8 +948,10 @@ export default {
                 // $0 here.
                 // R26: release the nonce claim on timeout — client got no output.
                 // R55: a settled payment has been COLLECTED — never release its claim.
-        // Only an unsettled, undispatched claim may be released.
-        if (env.CONSUMED_TX_STORE && v && v.nonce && !paymentSettled && !upstreamDispatched) {
+        // R49: release only when the engine never RESPONDED (upstreamAccepted
+        // false) -- an ATTEMPTED dispatch is not a started one, and a collected
+        // payment is never released.
+        if (env.CONSUMED_TX_STORE && v && v.nonce && !paymentSettled && !upstreamAccepted) {
                   ctx.waitUntil((async () => {
                     try {
                       const id3 = env.CONSUMED_TX_STORE.idFromName('singleton');
@@ -988,10 +1004,12 @@ export default {
               // R56: dispatch was ATTEMPTED — compute may have started, so
               // reconcile to the reserved estimate, never $0.
               ctx.waitUntil(reconcileDailyBudget(env, budgetTxId + ':reconcile', est).catch(() => {}));
-        // R25: release the pre-dispatch nonce claim — no compute was bought/delivered.
+        // R49: engine never responded -> no compute bought -> release the claim.
         // R55: a settled payment has been COLLECTED — never release its claim.
-        // Only an unsettled, undispatched claim may be released.
-        if (env.CONSUMED_TX_STORE && v && v.nonce && !paymentSettled && !upstreamDispatched) {
+        // R49: release only when the engine never RESPONDED (upstreamAccepted
+        // false) -- an ATTEMPTED dispatch is not a started one, and a collected
+        // payment is never released.
+        if (env.CONSUMED_TX_STORE && v && v.nonce && !paymentSettled && !upstreamAccepted) {
           ctx.waitUntil((async () => {
             try {
               const id = env.CONSUMED_TX_STORE.idFromName('singleton');
@@ -1013,10 +1031,12 @@ export default {
         // accept, run, then fail. Reconcile the ESTIMATE (conservative billing)
         // rather than $0, and refund the payer for the undelivered output.
         ctx.waitUntil(reconcileDailyBudget(env, budgetTxId + ':reconcile', est).catch(() => {}));
-        // R25: release the pre-dispatch nonce claim — no compute was bought/delivered.
+        // R49: engine never responded -> no compute bought -> release the claim.
         // R55: a settled payment has been COLLECTED — never release its claim.
-        // Only an unsettled, undispatched claim may be released.
-        if (env.CONSUMED_TX_STORE && v && v.nonce && !paymentSettled && !upstreamDispatched) {
+        // R49: release only when the engine never RESPONDED (upstreamAccepted
+        // false) -- an ATTEMPTED dispatch is not a started one, and a collected
+        // payment is never released.
+        if (env.CONSUMED_TX_STORE && v && v.nonce && !paymentSettled && !upstreamAccepted) {
           ctx.waitUntil((async () => {
             try {
               const id = env.CONSUMED_TX_STORE.idFromName('singleton');
@@ -1042,10 +1062,12 @@ export default {
         // have accepted the job and failed while reporting. Reconcile the
         // ESTIMATE (conservative) rather than $0.
         ctx.waitUntil(reconcileDailyBudget(env, budgetTxId + ':reconcile', est).catch(() => {}));
-        // R25: release the pre-dispatch nonce claim — no compute was bought/delivered.
+        // R49: engine never responded -> no compute bought -> release the claim.
         // R55: a settled payment has been COLLECTED — never release its claim.
-        // Only an unsettled, undispatched claim may be released.
-        if (env.CONSUMED_TX_STORE && v && v.nonce && !paymentSettled && !upstreamDispatched) {
+        // R49: release only when the engine never RESPONDED (upstreamAccepted
+        // false) -- an ATTEMPTED dispatch is not a started one, and a collected
+        // payment is never released.
+        if (env.CONSUMED_TX_STORE && v && v.nonce && !paymentSettled && !upstreamAccepted) {
           ctx.waitUntil((async () => {
             try {
               const id = env.CONSUMED_TX_STORE.idFromName('singleton');
@@ -1264,7 +1286,7 @@ export default {
           }
         }
         // R55: a settled payment was COLLECTED — never release it.
-        if (env.CONSUMED_TX_STORE && v && v.nonce && !paymentSettled && !upstreamDispatched) {
+        if (env.CONSUMED_TX_STORE && v && v.nonce && !paymentSettled && !upstreamAccepted) {
           const id2 = env.CONSUMED_TX_STORE.idFromName('singleton');
           const stub2 = env.CONSUMED_TX_STORE.get(id2);
           await stub2.fetch('https://internal/release-nonce', {
