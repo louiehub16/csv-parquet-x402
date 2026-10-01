@@ -339,13 +339,26 @@ export async function cdpVerifyAndSettle(env, paymentHeaderB64, resourceName, mi
       const perm = isPermanentRejection(verifyRes.status, errBody);
       return {
         mode: 'cdp', ok: false, retryable: !perm,
+        // R32: a permanent verify rejection happens BEFORE anything is
+        // submitted, so nothing settled. Say so explicitly or the gateway keeps
+        // the nonce claim and locks the payer out of this authorization.
+        definitelyNotSubmitted: perm === true,
         reason: safeReason(errBody, `verify_http_${verifyRes.status}`),
       };
     }
     const vData = await verifyRes.json();
     if (!vData || vData.isValid !== true) {
-      const reason = safeReason(vData, 'verify_failed');
-      return { mode: 'cdp', ok: false, retryable: !isRejectionReason(reason), reason };
+      // R32: classify on the RAW facilitator text. safeReason() collapses it to
+      // 'verify_failed', which isRejectionReason() does not match -- so a real
+      // payment-phase rejection was treated as ambiguous and the nonce claim was
+      // never released. The returned reason stays sanitized (no text leakage).
+      const rawReason = reasonString(vData);
+      const isRej = isRejectionReason(rawReason);
+      return { mode: 'cdp', ok: false, retryable: !isRej,
+        // A payment-phase rejection at verify means the authorization is
+        // unusable and NOTHING was submitted -- release the nonce claim.
+        definitelyNotSubmitted: isRej === true,
+        reason: safeReason(vData, 'verify_failed') };
     }
 
     // ---- STEP 2: SETTLE ----
@@ -386,9 +399,17 @@ export async function cdpVerifyAndSettle(env, paymentHeaderB64, resourceName, mi
     if (!sData || sData.success !== true) {
       // 2xx without success: only an explicit payment-phase reason is a clean
       // rejection; anything else is an ambiguous post-submission state.
-      const reason = safeReason(sData, 'settle_failed');
-      if (isRejectionReason(reason)) {
-        return { mode: 'cdp', ok: false, retryable: false, reason };
+      // R32: classify on the RAW text (safeReason() would collapse it to
+      // 'settle_failed', which isRejectionReason() does not match), while
+      // still RETURNING only a sanitized code.
+      const rawReason = reasonString(sData);
+      if (isRejectionReason(rawReason)) {
+        // An explicit payment-phase rejection names a fault in the
+        // authorization itself, so the transfer did not execute. Without this
+        // flag the DO claim is never released and the payer is locked out.
+        return { mode: 'cdp', ok: false, retryable: false,
+          definitelyNotSubmitted: true,
+          reason: safeReason(sData, 'settle_failed') };
       }
       return { mode: 'cdp', ok: false, retryable: false, settledUnknown: true, reason: 'settle_unconfirmed' };
     }
