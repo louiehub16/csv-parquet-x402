@@ -163,6 +163,8 @@ export default {
       // R51/R55: dispatched = upstream work started; settled = payment collected.
       let paymentSettled = false;
       let upstreamDispatched = false;
+      // R84: set the moment we call the facilitator.
+      let settleAttempted = false;
       // R57: durable refund record for settled-but-undelivered jobs.
       // R58: release the daily-budget reservation (nothing dispatched yet).
       const releaseReservation = () => {
@@ -195,6 +197,8 @@ export default {
         const cj = await claim.json().catch(() => null);
         if (!cj || cj.ok !== true) return false;      // already claimed/refunded
         if (cj.alreadyRefunded === true) return true; // another attempt completed it
+        // R83: the DO claim IS the durable record (it persists the claim in
+        // its own storage partition). KV is a convenience mirror only.
         const record = { nonce: v.nonce, payer: v.payer, amountUsdc: tier.microUsdc,
           reason, at: Date.now(), status: 'claimed' };
         await env.SECURITY_KV.put('refund:' + v.nonce, JSON.stringify(record),
@@ -202,8 +206,19 @@ export default {
         // Attempt execution now. The operator sweep (or the next call) retries
         // any still-queued refund; the client is told the true state.
         if (typeof env.X402_REFUND_URL === 'string' && env.X402_REFUND_URL) {
+          let refundUrl = null;
           try {
-            const resp = await fetch(env.X402_REFUND_URL, {
+            const u = new URL(env.X402_REFUND_URL);
+            // R83: the refund call carries a bearer secret — HTTPS only.
+            if (u.protocol !== 'https:') {
+              console.error('[gateway] refusing insecure refund endpoint');
+            } else {
+              refundUrl = u.toString();
+            }
+          } catch (e) { refundUrl = null; }
+          if (refundUrl) {
+          try {
+            const resp = await fetch(refundUrl, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json',
                 Authorization: 'Bearer ' + (env.X402_REFUND_SECRET || '') },
@@ -223,6 +238,7 @@ export default {
               return true;
             }
           } catch (e) { /* stays queued for the sweep */ }
+          }
         }
         return false;
       };
@@ -235,8 +251,32 @@ export default {
         return json({ error: 'upload_too_large', max_bytes: MAX_UPLOAD_BYTES }, 413);
       }
 
+      // R82: read the body ONCE with a hard byte ceiling. A chunked request has
+      // no Content-Length, so the pre-check above cannot be trusted alone.
+      let rawBody;
+      try {
+        const reader = request.body.getReader();
+        const chunks = [];
+        let total = 0;
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          total += value.length;
+          if (total > 128 * 1024 * 1024) {
+            try { await reader.cancel(); } catch (_) {}
+            return json({ error: 'upload_too_large', max_bytes: 128 * 1024 * 1024 }, 413);
+          }
+          chunks.push(value);
+        }
+        rawBody = new Uint8Array(total);
+        let o = 0;
+        for (const c of chunks) { rawBody.set(c, o); o += c.length; }
+      } catch (e) {
+        return json({ error: 'bad_multipart' }, 400);
+      }
       let form;
-      try { form = await request.formData(); } catch (e) { return json({ error: 'bad_multipart' }, 400); }
+      try { form = await new Response(rawBody, { headers: request.headers }).formData(); }
+      catch (e) { return json({ error: 'bad_multipart' }, 400); }
       const file = form.get('file');
       if (file && typeof file.size === 'number' && file.size > 128 * 1024 * 1024) {
         return json({ error: 'upload_too_large', max_bytes: 128 * 1024 * 1024 }, 413);
@@ -392,24 +432,36 @@ export default {
           if (!cdpConfigured(env)) return { ok: false, reason: 'settlement_not_configured' };
           const hdrB64 = request.headers.get('PAYMENT-SIGNATURE')
             || request.headers.get('X-PAYMENT') || '';
+          // R74: CLAIM FIRST. The DO reserve is atomic, so two concurrent
+          // retries can never both reach the facilitator with one
+          // authorization — the loser is rejected before any funds move.
+          const claimNonce = (info && info.nonce) || v0Nonce;
+          try { await consumeNonce(env, claimNonce); }
+          catch (e) {
+            console.error('[gateway] nonce claim rejected before settlement:', (e && e.message) || e);
+            return { ok: false, reason: 'nonce_consumption_failed', terminal: false };
+          }
+          settleAttempted = true;
           const r = await cdpVerifyAndSettle(env, hdrB64,
             'csv-parquet-stream-compressor', tier.microUsdc, tier.microUsdc);
-          if (r.ok !== true) return { ok: false, reason: r.reason, settledUnknown: r.settledUnknown };
-          if (!/^0x[0-9a-fA-F]{64}$/.test(String(r.settledTx || '')))
-            return { ok: false, reason: 'settle_tx_unproven' };
-          const burnNonce = (info && info.nonce) || v0Nonce;
-          // R59: if the burn fails the transfer is STILL COLLECTED — report
-          // success and record a durable audit note. Never tell the verifier
-          // "not paid" (that would let the authorization be retried).
-          // R61: burn failure is TERMINAL. The authorization would stay
-          // replayable, so we must not dispatch it: report failure, and the
-          // gateway's refund path compensates the payer.
-          try { await consumeNonce(env, burnNonce); }
-          catch (e) {
-            console.error('[gateway] nonce burn failed post-settlement:', (e && e.message) || e);
-            return { ok: false, reason: 'nonce_consumption_failed', terminal: true };
+          if (r.ok !== true) {
+            // Funds may or may not have moved: release the claim only when the
+            // facilitator guarantees nothing was submitted, else keep it and
+            // queue a refund.
+            if (r.definitelyNotSubmitted === true) {
+              try { await env.SECURITY_KV.delete('x402_nonce:' + claimNonce); } catch (_) {}
+              return { ok: false, reason: r.reason, definitelyNotSubmitted: true };
+            }
+            return { ok: false, reason: r.reason, settledUnknown: r.settledUnknown,
+              refundRequired: r.settledUnknown === true };
           }
-          return { ok: true, settledTx: r.settledTx, settledFrom: r.settledFrom,
+          if (!/^0x[0-9a-fA-F]{64}$/.test(String(r.settledTx || ''))) {
+            // R68: the facilitator said "paid" but gave no provable tx. Treat it
+            // as TERMINAL and refundable — never a retryable "not paid".
+            console.error('[gateway] settle ok but tx unproven', v0Nonce);
+            return { ok: false, reason: 'settle_tx_unproven', terminal: true, refundable: true };
+          }
+                    return { ok: true, settledTx: r.settledTx, settledFrom: r.settledFrom,
             settledTo: r.settledTo, settledAmountUsdc: r.settledAmountUsdc,
             settledNonce: r.settledNonce };
         },
@@ -442,7 +494,15 @@ export default {
         },
       });
       if (!v.ok) {
-        releaseReservation();   // R58: no job ran, refund the reservation
+        if (v.refundRequired || v.refundable) {
+          // R70: payment was taken but settlement failed terminally — refund now.
+          const refunded = await recordRefund(v.reason || 'settlement_terminal_failure');
+          paymentSettled = true;              // funds were collected
+          return json({ error: 'settlement_failed', reason: v.reason,
+            refund: refunded ? 'completed' : 'queued',
+            support: 'quote the nonce for support if the refund is queued' }, 502);
+        }
+        releaseReservation();   // R58: nothing paid, release the reservation
         return v.failResponse;
       }
       // v.ok:true means the transfer settled AND the nonce was consumed
@@ -534,11 +594,10 @@ export default {
       if (request.signal) request.signal.removeEventListener('abort', onAbort);
 
       if (!upstream.ok) {
-        // R24 + OX-ALPHA (FIX-2): a non-2xx from RunPod means no conversion
-        // output was delivered — reconcile the reservation to $0 (the previous
-        // code passed `est`, leaving the full estimate standing against the
-        // daily ledger). OX-ALPHA (FIX-3): unified ':reconcile' key.
-        ctx.waitUntil(reconcileDailyBudget(env, budgetTxId + ':reconcile', 0).catch(() => {}));
+        // R77: a non-2xx does NOT prove the job never started — RunPod can
+        // accept, run, then fail. Reconcile the ESTIMATE (conservative billing)
+        // rather than $0, and refund the payer for the undelivered output.
+        ctx.waitUntil(reconcileDailyBudget(env, budgetTxId + ':reconcile', est).catch(() => {}));
         // R25: release the pre-dispatch nonce claim — no compute was bought/delivered.
         // R55: a settled payment has been COLLECTED — never release its claim.
         // Only an unsettled, undispatched claim may be released.
@@ -563,12 +622,10 @@ export default {
       let parsed;
       try { parsed = JSON.parse(text); } catch (e) { parsed = null; }
       if (!parsed || typeof parsed !== 'object') {
-        // OX-ALPHA (completes R24 coverage): a non-JSON body means no
-        // conversion output was delivered, so treat it like the other
-        // pre-output failures (upstream_unreachable / upstream_error):
-        // reconcile the reservation to $0 — no compute was bought.
-        // OX-ALPHA (FIX-3): unified ':reconcile' key on ALL reconciles.
-        ctx.waitUntil(reconcileDailyBudget(env, budgetTxId + ':reconcile', 0).catch(() => {}));
+        // R79: a non-JSON body does NOT prove no compute ran — the engine may
+        // have accepted the job and failed while reporting. Reconcile the
+        // ESTIMATE (conservative) rather than $0.
+        ctx.waitUntil(reconcileDailyBudget(env, budgetTxId + ':reconcile', est).catch(() => {}));
         // R25: release the pre-dispatch nonce claim — no compute was bought/delivered.
         // R55: a settled payment has been COLLECTED — never release its claim.
         // Only an unsettled, undispatched claim may be released.
@@ -588,7 +645,36 @@ export default {
       }
       const ALLOWED = ['status','output_bucket','output_key','rows','skipped_columns','skipped_rows','drift_fallback','duration_s','estimated_cost_usd','warning'];
       const body = {};
-      for (const k of ALLOWED) if (parsed[k] !== undefined) body[k] = parsed[k];
+      // R80: validate each relayed field — bounded strings, no credential-looking
+      // values, so a compromised engine cannot leak secrets through us.
+      const SECRETS = /(?:AKIA|ASIA|sk[-_]|secret|passwd|password|token|private[_-]?key|BEGIN [A-Z ]*PRIVATE KEY)/i;
+      const cleanStr = (v, max = 300) => {
+        if (typeof v !== 'string') return undefined;
+        // Reject anything query-bearing or credential-like BEFORE truncation,
+        // so a signed URL cannot be smuggled through.
+        if (/[?&]/.test(v) || /%3f|%26/i.test(v)) return '[redacted-url]';
+        if (SECRETS.test(v)) return '[redacted]';
+        if (v.length > max) return v.slice(0, max) + '…';
+        return v;
+      };
+      // Structured identifiers (bucket/key) must look like plain object paths.
+      const plainPath = (v, max = 300) => {
+        if (typeof v !== 'string') return undefined;
+        if (!/^[A-Za-z0-9._\-/:]{1,200}$/.test(v)) return '[invalid]';
+        return v.slice(0, max);
+      };
+      for (const k of ALLOWED) {
+        if (parsed[k] === undefined) continue;
+        if (typeof parsed[k] === 'string') {
+          body[k] = (k === 'output_bucket' || k === 'output_key')
+            ? plainPath(parsed[k])
+            : cleanStr(parsed[k], k === 'warning' ? 200 : 120);
+        } else if (typeof parsed[k] === 'number' && Number.isFinite(parsed[k])) {
+          body[k] = parsed[k];
+        } else if (k === 'skipped_columns' && Array.isArray(parsed[k])) {
+          body[k] = parsed[k].slice(0, 100).map((c) => cleanStr(c, 80)).filter(Boolean);
+        }
+      }
       // R64: do NOT relay the engine's presigned download_url — the signed
       // query string IS a bearer credential. Advertise the controlled endpoint.
       if (parsed.download_url) body.download_via = '/v1/compress/result?ref=' + encodeURIComponent(JSON.stringify({
@@ -652,6 +738,10 @@ export default {
       let refundFail = false;
       let refundQueued = false;
       try {
+        // R84: only refund when we KNOW funds moved. `settleAttempted`
+        // means the facilitator was called (outcome unknown -> queue a
+        // refund) while `v === null` with no attempt means nothing happened.
+        if (!paymentSettled && settleAttempted) paymentSettled = true;
         if (paymentSettled && v && v.nonce) {
           // R65/R67: the payer paid and got nothing. A refund MUST be durably
           // recorded; if that fails we report 'required' so the operator
@@ -672,7 +762,6 @@ export default {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ nonce: v.nonce }) });
         }
-        if (paymentSettled) await recordRefund('internal_error_after_settlement');
       } catch (_) {}
       console.error('[gateway] internal_error:', (e && e.stack) || e);
       return json({ error: 'internal_error',

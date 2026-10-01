@@ -467,16 +467,28 @@ export async function verifyPayment(env, request, opts = {}) {
     // late settlement. The client must present a FRESH authorization.
     return challenge('settlement_failed', 502);
   }
-  if (!settlement || settlement.ok !== true || typeof settlement.settledTx !== 'string' ||
-      !/^0x[0-9a-fA-F]{64}$/.test(settlement.settledTx)) {
-    // Not settled, or settled without a provable transaction hash. The claim is
-    // released ONLY when the settler explicitly guarantees nothing was
-    // submitted; otherwise the transfer may still broadcast and retaining the
-    // claim is what prevents one payment from buying two deliveries.
+  if (!settlement || settlement.ok !== true) {
+    // R69: distinguish (a) nothing was submitted (retryable, release the claim)
+    // from (b) the settler REFUSED a payment that was already taken — terminal
+    // and the payer must be compensated.
+    if (settlement && settlement.terminal === true) {
+      return {
+        ok: false, paid: true, refundRequired: true,
+        reason: settlement.reason || 'settlement_failed',
+        payer: auth.from, nonce: nonceHex, amountUsdc: String(auth.value),
+      };
+    }
     if (settlement && settlement.definitelyNotSubmitted === true) {
       await releaseNonceClaim(env, nonceHex);
     }
     return challenge('settlement_unconfirmed', 503);
+  }
+  if (typeof settlement.settledTx !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(settlement.settledTx)) {
+    // R69: settled but UNPROVABLE — the payer paid; never let this be retried.
+    return {
+      ok: false, paid: true, refundRequired: true, reason: 'settle_tx_unproven',
+      payer: auth.from, nonce: nonceHex, amountUsdc: String(auth.value),
+    };
   }
   // R48: once a transfer is CONFIRMED on-chain, the claim is permanent. A
   // metadata mismatch afterwards must NOT release it, or the same (already
@@ -497,7 +509,14 @@ export async function verifyPayment(env, request, opts = {}) {
       return challenge('settlement_unconfirmed', 503);
     }
     if (!conf || conf.confirmed !== true) {
-      return challenge('settlement_unconfirmed', 503);
+      // R81: the facilitator reported success, so funds were collected even
+      // though our independent on-chain check could not confirm. This is a
+      // refundable terminal outcome, not a plain "not paid".
+      return {
+        ok: false, paid: true, refundRequired: true,
+        reason: 'settlement_unconfirmed',
+        payer: auth.from, nonce: nonceHex, amountUsdc: String(auth.value),
+      };
     }
     transferConfirmed = true;
   } else {
