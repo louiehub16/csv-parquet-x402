@@ -7,13 +7,14 @@
 
 A serverless data-conversion endpoint for delimited-text files. Today's public
 endpoint accepts uploads up to ~100 MB per request (direct multi-GB streaming
-is roadmap), emitting ZSTD-compressed Apache Parquet. Inputs under 10 GB
-land automatically in provider R2 temp storage (24-hour lifecycle). The
+is roadmap), emitting ZSTD-compressed Apache Parquet. Inputs BELOW 10 GiB
+(10737418240 bytes) land automatically in provider R2 temp storage (24-hour
+lifecycle). The
 response carries `download_via`, a controlled result endpoint -- the engine's
 own presigned link is deliberately NOT returned, because a presigned query
 string is itself a bearer credential. GET `/v1/compress/result?ref=...` with the
 same `PAYMENT-SIGNATURE` header used to pay, and it returns the storage
-coordinates for your object. Inputs at or above 10 GB require the caller to
+coordinates for your object. Inputs at or above 10 GiB (10737418240 bytes) require the caller to
 supply an S3-compatible `target_destination` where the result is written
 permanently on the caller's own storage.
 
@@ -32,7 +33,7 @@ Multipart form fields:
 | Field               | Type   | Required | Notes                                                                 |
 |---------------------|--------|----------|-----------------------------------------------------------------------|
 | `file`              | binary | yes      | The .csv / .tsv / .txt payload to compress                            |
-| `target_destination`| string | optional | JSON string describing an S3-compatible destination; **required when input >= 10 GB** |
+| `target_destination`| string | optional | JSON string describing an S3-compatible destination; **required when input >= 10 GiB (10737418240 bytes)** |
 
 Payment flow:
 
@@ -58,8 +59,8 @@ Base via x402 v2 (exact scheme).
 | # | Input size range (bytes)                | Rate         | Cost example        | Storage target              | Retention                  |
 |---|-----------------------------------------|--------------|---------------------|------------------------------|----------------------------|
 | 1 | under 100 MB                              | flat $0.01   | $0.01               | internal_r2                  | 24_hours                   |
-| 2 | 100 MB – 10 GB                           | $0.10 per GB | 5 GB → $0.50        | internal_r2                  | 24_hours                   |
-| 3 | 10 GB – 100 GB                           | $0.05 per GB | 50 GB → $2.50       | user_supplied_destination    | permanent_on_user_storage  |
+| 2 | 100 MB – 10 GiB                          | $0.10 per GB | 5 GB → $0.50        | internal_r2                  | 24_hours                   |
+| 3 | 10 GiB – 100 GiB                         | $0.05 per GB | 50 GB → $2.50       | user_supplied_destination    | permanent_on_user_storage  |
 | 4 | 100 GB – 1 TB                            | $0.015 per GB| 500 GB → $7.50      | user_supplied_destination    | permanent_on_user_storage  |
 | 5 | above 1 TB                                | $0.008 per GB| 5 TB → $40.00       | user_supplied_destination    | permanent_on_user_storage  |
 
@@ -81,7 +82,7 @@ above 1 TB.
 
 - Internal R2 result retention: **24 hours** (enforced by the deployed
   `r2-lifecycle.json` bucket rule) — download promptly.
-- **>= 10 GB rule:** inputs at or above 10737418240 bytes REQUIRE a
+- **>= 10 GiB rule:** inputs at or above 10737418240 bytes REQUIRE a
   caller-supplied S3-compatible `target_destination`; no internal hosting.
 - Output codec is always ZSTD-compressed Parquet (`parquet+zstd`).
 - Gateway timeouts apply on extremely slow streams. There is no resumable
