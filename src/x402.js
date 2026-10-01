@@ -649,16 +649,14 @@ export function estimateCostUsd(sizeBytes, env) {
   return Number.isFinite(cost) && cost > 0 ? cost : 0;
 }
 
-// OFFLINE VERIFICATION NOTE (honest limitation): verifyPayment DISCARDS the
-// payment payload after signature recovery — nothing is persisted or settled.
-// Consequence: delivered conversions are currently UNCOLLECTIBLE unless an
-// operator independently captured the payment payload before it was dropped.
-// Wiring settleViaFacilitator / durable authorization persistence is required
-// before this service can collect revenue; until then it runs at a loss by
-// design (reviewer-flagged backlog item, not an oversight).
-// settleViaFacilitator is NOT yet wired into the success flow (roadmap). The
-// verified authorization payload is currently DISCARDED after verification —
-// there is no durable payment record and no collectible settlement exists.
+// SETTLEMENT (R29): settlement IS wired. verifyPayment() requires an
+// opts.settle callback and returns ok:true ONLY after that callback proves a
+// confirmed on-chain transfer. The gateway passes
+// cdp.js::cdpVerifyAndSettle, which performs CDP verify + settle and requires a
+// provable transaction hash (plus an independent on-chain confirmation bound to
+// the authorization nonce) before reporting success. There is no offline-only
+// or discarded-payload path: ambiguous or unprovable outcomes are REFUNDABLE,
+// never silently delivered.
 // Optional CDP-facilitator settlement call (used only when CDP keys exist).
 // settleViaFacilitator — REMOVED (R34).
 // The only settlement implementation is cdp.js::cdpVerifyAndSettle, which

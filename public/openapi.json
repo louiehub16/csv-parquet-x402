@@ -143,7 +143,7 @@
         },
         "responses": {
           "200": {
-            "description": "Compression succeeded; result stored at presigned R2 link or caller-supplied destination",
+            "description": "Compression succeeded. The result object is written to internal R2 (or the caller-supplied destination) and is NOT returned as a presigned link \u2014 the signed query string is itself a bearer credential. Fetch the result through download_via: GET /v1/compress/result?ref=... with the same PAYMENT-SIGNATURE header used to pay; it returns the storage coordinates (bucket, key) for the object.",
             "content": {
               "application/json": {
                 "schema": {

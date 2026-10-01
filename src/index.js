@@ -187,11 +187,16 @@ export default {
         try { refObj = JSON.parse(url.searchParams.get('ref') || ''); }
         catch (e) { refObj = null; }
         if (refObj && typeof refObj === 'object' && !Array.isArray(refObj) &&
-            refObj.key && sanitizeKey(String(refObj.key)) !== String(receipt.key)) {
+            refObj.key && String(refObj.key) !== String(receipt.key)) {
           return json({ error: 'ref_mismatch',
             message: 'That ref does not belong to this payment.' }, 403);
         }
-        const key = sanitizeKey(String(receipt.key || ''));
+        // R29: the receipt already stores the sanitized object key. Running
+        // sanitizeKey() again here stripped the path separator, so
+        // 'outputs/file.parquet' became 'outputsfile.parquet' and named no
+        // stored object -- every paid result was unfetchable. Return the
+        // receipt's key verbatim; it was sanitized when the receipt was written.
+        const key = String(receipt.key || '');
         const bucket = String(receipt.bucket || '');
         if (!key || !bucket) return json({ error: 'result_not_found' }, 404);
         return json({
@@ -965,7 +970,9 @@ export default {
       if (v && v.nonce && parsed && typeof parsed.output_key === 'string') {
         const receipt = {
           nonce: v.nonce, payer: v.payer || null, amountUsdc: tier.microUsdc,
-          bucket: parsed.output_bucket || null, key: parsed.output_key,
+          // R29: store the key SANITIZED, here and only here, so retrieval can
+          // return it verbatim without re-deriving (and corrupting) it.
+          bucket: parsed.output_bucket || null, key: sanitizeKey(parsed.output_key),
           settledTx: v.settledTx || null, at: Date.now(),
         };
         // R26: AWAIT the receipt, not waitUntil. Returning success while the
