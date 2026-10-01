@@ -226,13 +226,18 @@ export async function signDigest(digest32, privBytes) {
     if (s === 0n) continue;
     // EIP-2 low-s normalization so on-chain verifiers that reject high-s
     // (USDC / OpenZeppelin) accept the signature.
-    if (s > N / 2n) s = N - s;
-    // Recovery id for the LOW-S-normalized signature.
+    // R23: RECORD whether the flip actually happened. Negating s to n-s negates
+    // the public key to (Qx, n-Ry), which flips the y-parity -- but ONLY when a
+    // flip occurred. The previous code inverted unconditionally, so every
+    // signature whose s was already low carried a WRONG recovery id: ~half of
+    // all signatures were unverifiable (and unrecoverable here).
+    const normalized = s > N / 2n;
+    if (normalized) s = N - s;
+    // Recovery id for the (possibly) LOW-S-normalized signature.
     // Unnormalized:  v = (R.y & 1) | (R.x > n ? 2 : 0)
-    // When s > n/2 we flip s -> n-s, which negates the public key to (Qx, n-Ry);
-    // negating flips the y parity, so the recovery bit must be INVERTED.
     const overflowed = R.x >= N;
-    const parity = (R.y & 1n ? 1 : 0) ^ 1;   // inverted by low-s normalization
+    const baseParity = (R.y & 1n ? 1 : 0);
+    const parity = normalized ? (baseParity ^ 1) : baseParity;
     const recovery = (parity ^ (overflowed ? 1 : 0)) & 1;
     return { r, s, recovery };
   }

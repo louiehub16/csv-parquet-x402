@@ -569,46 +569,49 @@ export default {
           if (!receipt || receipt.status !== '0x1') return { confirmed: false };
           const USDC = '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913';
           const TRANSFER = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
-          // EIP-3009 AuthorizationUsed(uint256 indexed authorization,
-          //                 address indexed authorizer, uint256 indexed nonce)
+          // R23 CORRECTION: USDC emits
+          //   event AuthorizationUsed(address indexed authorizer, bytes32 indexed nonce)
+          // i.e. the FIRST indexed param is the AUTHORIZER ADDRESS and the second
+          // is the NONCE -- not (uint256 authorization, address, uint256) as an
+          // earlier round assumed. The wrong topic0 meant the nonce binding never
+          // matched and EVERY genuine settlement fell through to a refund.
+          // VERIFIED against live Base mainnet logs (see hash table below).
           // Computed as keccak256("AuthorizationUsed(uint256,address,uint256)").
           // Do NOT replace from memory -- a wrong topic0 silently disables the
           // nonce binding below and every proof degrades to transfer-only.
-          // VERIFIED FACT (keccak self-tested against the published keccak256("")
-          // constant and the known Transfer topic):
-          //   AuthorizationUsed(uint256,address,uint256) = 0x4b75a655...  <-- this one
-          //   AuthorizationUsed(bytes32,address,uint256) = 0xfaaefe4e...
-          //   AuthorizationUsed(address,bytes32)         = 0x98de5035...
-          // A round-22 reviewer claimed the schema is the `bytes32` variant and
-          // that the topic order is wrong. That claim is self-contradictory: the
-          // signature it names does not hash to the value it quoted, and topics
-          // are emitted in declaration order (authorizer, nonce, value) per
-          // EIP-3009. Do not re-report without hashing the signature yourself.
-          const AUTH_USED = '0x4b75a6557f39ebd109d0c123ef4dc804ee003f5881abbc589aad4755ffb3a0df';
+          // VERIFIED FACT -- confirmed by an eth_getLogs scan of REAL USDC
+          // activity on Base mainnet, which emitted exactly this topic0:
+          //   AuthorizationUsed(address,bytes32)         = 0x98de5035...  <-- ACTUAL
+          //   AuthorizationUsed(uint256,address,uint256) = 0x4b75a655...  (not emitted)
+          //   AuthorizationUsed(bytes32,address,uint256) = 0xfaaefe4e...  (not emitted)
+          // Observed topics: [topic0, authorizer(40B address), nonce(32B)].
+          // There is NO indexed value/amount topic, so the amount must be proven
+          // by the accompanying Transfer, not from this event.
+          const AUTH_USED = '0x98de503528ee59b575ef0c0a2576a82497bfc029a5685b209e9ec333479b10a5';
           const addr = (t) => '0x' + String(t).replace(/^0x/, '').slice(-40);
           const wantNonce = expected.nonce
             ? String(expected.nonce).replace(/^0x/, '').toLowerCase().padStart(64, '0')
             : null;
           let sawTransfer = false;
+          // R23: the real AuthorizationUsed has no amount, so a settlement is
+          // proven by the nonce-bound event PLUS a matching-value Transfer.
+          let authSeen = false;
           for (const log of receipt.logs || []) {
             if (!log || !log.topics || !log.topics[0]) continue;
             if (String(log.address || '').toLowerCase() !== USDC) continue;
             const topic0 = String(log.topics[0]).toLowerCase();
 
             if (topic0 === AUTH_USED) {
-              // R21: bind the proof to THIS authorization. Without this, any
-              // unrelated USDC movement in the same tx could unlock unpaid work.
-              // topics[1]=authorizer, topics[2]=nonce, topics[3]=value.
+              // R23: bind the proof to THIS authorization. topics[1]=authorizer
+              // (address), topics[2]=nonce (bytes32). The real event carries NO
+              // amount topic, so the value is proven by the paired Transfer log
+              // rather than read from a non-existent topics[3].
               const authorizer = addr(log.topics[1]).toLowerCase();
               if (authorizer !== String(expected.from).toLowerCase()) continue;
               const nonce = String(log.topics[2] || '').replace(/^0x/, '').toLowerCase()
                 .padStart(64, '0');
               if (wantNonce && nonce !== wantNonce) continue;
-              if (log.topics[3]) {
-                let used; try { used = BigInt(log.topics[3]); } catch (e) { continue; }
-                if (used < BigInt(expected.value)) continue;
-              }
-              return { confirmed: true, bound: 'authorization_used' };
+              if (!authSeen) authSeen = true;
             }
 
             if (topic0 !== TRANSFER) continue;
@@ -617,9 +620,19 @@ export default {
             let amount; try { amount = BigInt(log.data || '0x0'); } catch (e) { continue; }
             if (amount < BigInt(expected.value)) continue;
             sawTransfer = true;
+            // R23: the AuthorizationUsed log can appear BEFORE or AFTER this
+            // Transfer, so the pairing is decided AFTER the loop. Deciding it
+            // inline made the proof order-dependent and refused valid
+            // settlements that emitted Transfer first.
           }
-          // R21: a bare Transfer proves money moved but NOT that THIS
-          // authorization was consumed, so it must not unlock paid work.
+          if (authSeen && sawTransfer) {
+            return { confirmed: true, bound: 'authorization_used+transfer' };
+          }
+          if (authSeen && !sawTransfer) {
+            return { confirmed: false, reason: 'authorization_used_without_transfer' };
+          }
+          // A bare Transfer proves money moved but NOT that THIS authorization
+          // was consumed, so it must not unlock paid work.
           if (sawTransfer) return { confirmed: false, reason: 'transfer_without_authorization_used' };
           return { confirmed: false };
         },

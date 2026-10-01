@@ -96,9 +96,11 @@ globalThis.fetch = async (url, opts) => {  const u0 = String(url);
 
   if (u0.includes('eth_getTransactionReceipt') ||
       (opts && String(opts.body || '').includes('eth_getTransactionReceipt'))) {
-    // R21: a real EIP-3009 settle emits AuthorizationUsed. The confirm step
-    // binds the proof to the authorization NONCE, so the fixture must too --
-    // a bare Transfer is (correctly) no longer sufficient.
+    // R21/R23: a real EIP-3009 settle emits
+    //   AuthorizationUsed(address indexed authorizer, bytes32 indexed nonce)
+    // (topic0 0x98de5035..., confirmed against live Base mainnet USDC logs).
+    // The confirm step requires that event PLUS a matching-value Transfer, so
+    // the fixture emits both. A bare Transfer is (correctly) not sufficient.
     return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: {
       status: '0x1',
       logs: [      { address: '0x833589FCD6eDb6E08f4c7C32D4f71b54bdA02913',
@@ -107,7 +109,7 @@ globalThis.fetch = async (url, opts) => {  const u0 = String(url);
           '0x795dca28d0e8a0e5d19d689163f125a7da1d0b83'],
         data: '0x' + (10000).toString(16).padStart(64, '0') }
       , { address: '0x833589FCD6eDb6E08f4c7C32D4f71b54bdA02913',
-        topics: ['0x4b75a6557f39ebd109d0c123ef4dc804ee003f5881abbc589aad4755ffb3a0df',
+        topics: ['0x98de503528ee59b575ef0c0a2576a82497bfc029a5685b209e9ec333479b10a5',
           '0x' + '0'*24 + '19e7e376e7c213b7e7e7e46cc70a5dd086daff2a',
           '0x' + String(lastAuthNonce).replace(/^0x/, ''),
           '0x' + (10000).toString(16).padStart(64, '0')] }]
