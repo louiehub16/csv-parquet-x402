@@ -163,6 +163,20 @@ export default {
       // R51/R55: dispatched = upstream work started; settled = payment collected.
       let paymentSettled = false;
       let upstreamDispatched = false;
+      // R57: durable refund record for settled-but-undelivered jobs.
+      // R58: release the daily-budget reservation (nothing dispatched yet).
+      const releaseReservation = () => {
+        if (typeof budgetTxId === 'string' && budgetTxId) {
+          ctx.waitUntil(reconcileDailyBudget(env, budgetTxId + ':reconcile', 0).catch(() => {}));
+        }
+      };
+      const recordRefund = (reason) => {
+        try {
+          ctx.waitUntil(env.SECURITY_KV.put('refund:' + v.nonce, JSON.stringify({
+            nonce: v.nonce, payer: v.payer, amountUsdc: tier.microUsdc,
+            reason, at: Date.now() }), { expirationTtl: 604800 }).catch(() => {}));
+        } catch (e) {}
+      };
       let form;
       try { form = await request.formData(); } catch (e) { return json({ error: 'bad_multipart' }, 400); }
       const file = form.get('file');
@@ -296,6 +310,8 @@ export default {
       // (8) PAYMENT VERIFY — challenge carries the EXACT tier price; the
       //     signed authorization must commit to exactly that amount.
       if (oversizedPaymentHeader) {
+        // R58: nothing will be dispatched, so release the reservation first.
+        releaseReservation();
         // Priced 402 (not a bare 400): x402 clients only act on 402 challenges.
         return buildChallenge({
           url: request.url,
@@ -354,7 +370,10 @@ export default {
           return { confirmed: false };
         },
       });
-      if (!v.ok) return v.failResponse;
+      if (!v.ok) {
+        releaseReservation();   // R58: no job ran, refund the reservation
+        return v.failResponse;
+      }
       // v.ok:true means the transfer settled AND the nonce was consumed
       // (verifyPayment refuses to return ok without both).
       paymentSettled = true;
@@ -412,6 +431,7 @@ export default {
                     } catch (_) {}
                   })());
                 }
+                recordRefund('gateway_timeout');
                 return json({ error: 'gateway_timeout' }, 504);
               }
               // R24 + OX-ALPHA: only a genuine network drop that occurs before
@@ -436,7 +456,8 @@ export default {
             } catch (_) {}
           })());
         }
-              return json({ error: 'upstream_unreachable' }, 502);
+              recordRefund('upstream_unreachable');
+                return json({ error: 'upstream_unreachable' }, 502);
             }
       clearTimeout(timeoutId);
       if (request.signal) request.signal.removeEventListener('abort', onAbort);
@@ -464,7 +485,8 @@ export default {
         // Never relay upstream error bodies: platform messages can embed
         // request ids, storage endpoints or signed URLs. Generic error only;
         // details stay in worker logs (observability streams the raw tail).
-        return json({ error: 'upstream_error', upstream_status: upstream.status }, 502);
+        recordRefund('upstream_error');
+        return json({ error: 'upstream_error', upstream_status: upstream.status, refundable: true }, 502);
       }
       const text = await upstream.text();
       let parsed;
@@ -490,7 +512,8 @@ export default {
             } catch (_) {}
           })());
         }
-        return json({ error: 'upstream_error', upstream_status: upstream.status }, 502);
+        recordRefund('upstream_error');
+        return json({ error: 'upstream_error', upstream_status: upstream.status, refundable: true }, 502);
       }
       const ALLOWED = ['status','output_bucket','output_key','rows','skipped_columns','skipped_rows','drift_fallback','duration_s','estimated_cost_usd','download_url','warning'];
       const body = {};
@@ -553,14 +576,14 @@ export default {
       } catch (_) {}
       try {
         // R55: a settled payment was COLLECTED — never release it.
-        if (env.CONSUMED_TX_STORE && typeof v !== 'undefined' && v && v.nonce
-            && !paymentSettled && !upstreamDispatched) {
+        if (env.CONSUMED_TX_STORE && v && v.nonce && !paymentSettled && !upstreamDispatched) {
           const id2 = env.CONSUMED_TX_STORE.idFromName('singleton');
           const stub2 = env.CONSUMED_TX_STORE.get(id2);
           await stub2.fetch('https://internal/release-nonce', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ nonce: v.nonce }) });
         }
+        if (paymentSettled) recordRefund('internal_error_after_settlement');
       } catch (_) {}
       console.error('[gateway] internal_error:', (e && e.stack) || e);
       return json({ error: 'internal_error' }, 500);
