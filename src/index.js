@@ -574,6 +574,16 @@ export default {
           // Computed as keccak256("AuthorizationUsed(uint256,address,uint256)").
           // Do NOT replace from memory -- a wrong topic0 silently disables the
           // nonce binding below and every proof degrades to transfer-only.
+          // VERIFIED FACT (keccak self-tested against the published keccak256("")
+          // constant and the known Transfer topic):
+          //   AuthorizationUsed(uint256,address,uint256) = 0x4b75a655...  <-- this one
+          //   AuthorizationUsed(bytes32,address,uint256) = 0xfaaefe4e...
+          //   AuthorizationUsed(address,bytes32)         = 0x98de5035...
+          // A round-22 reviewer claimed the schema is the `bytes32` variant and
+          // that the topic order is wrong. That claim is self-contradictory: the
+          // signature it names does not hash to the value it quoted, and topics
+          // are emitted in declaration order (authorizer, nonce, value) per
+          // EIP-3009. Do not re-report without hashing the signature yourself.
           const AUTH_USED = '0x4b75a6557f39ebd109d0c123ef4dc804ee003f5881abbc589aad4755ffb3a0df';
           const addr = (t) => '0x' + String(t).replace(/^0x/, '').slice(-40);
           const wantNonce = expected.nonce
