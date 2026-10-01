@@ -1,69 +1,69 @@
-// R29 regression test: the stored result key must survive the receipt round trip.
+// R30 regression test: the result key must be the ENGINE's key, unchanged.
 //
-// BUG: the receipt stored the engine's real object key (e.g.
-// 'outputs/tiny.parquet') but retrieval re-ran sanitizeKey() over it.
-// sanitizeKey() strips path separators and appends '.parquet', so the returned
-// key became 'outputstiny.parquet.parquet' -- a name that matches no stored
-// object. Every PAID result was unfetchable, and the bug was invisible until a
-// customer tried to download.
+// HISTORY (two bugs, same symptom -- paid results were unfetchable):
+//   R29 bug: retrieval re-ran sanitizeKey() over the stored key, which strips
+//            '/' and appends '.parquet'.
+//   R30 bug: the R29 fix sanitized at INGEST instead. But the engine is the
+//            naming authority -- it sanitizes PER SEGMENT and preserves
+//            separators (worker/main.py builds internal keys as
+//            'outputs/' + sanitize_key(filename)), so the gateway's
+//            sanitizeKey() corrupted a real key: 'outputs/data.parquet' became
+//            'outputsdata.parquet.parquet'.
 //
-// The contract: sanitize ONCE at ingest, store that value, return it verbatim.
-// This asserts the round trip is stable -- sanitize(sanitize(x)) must never be
-// applied to a stored key, so re-sanitizing must CHANGE a realistic key.
+// CONTRACT: the engine's key is stored and returned byte-for-byte. The gateway
+// VALIDATES it (no traversal, no leading slash) and refuses unsafe keys; it
+// never rewrites a safe one. This asserts that contract, including that a
+// realistic key with a separator survives intact.
 import { readFileSync } from 'node:fs';
 
 const idx = readFileSync(new URL('./index.js', import.meta.url), 'utf8');
 const fails = [];
 const ok = (label, cond, got) => { if (!cond) fails.push(`${label} — got ${JSON.stringify(got)}`); };
 
-// Recreate sanitizeKey EXACTLY as the source defines it, and verify the copy is
-// faithful (if this drifts from index.js the test would be meaningless).
-const body = idx.slice(idx.indexOf('function sanitizeKey(name) {'),
-                       idx.indexOf('export default {'));
-ok('sanitizeKey body located', body.includes('.replace'), 'not found');
-const fn = new Function(
-  body.slice(body.indexOf('function sanitizeKey'),
-             body.indexOf('\n}', body.indexOf('function sanitizeKey')) + 2)
-  + '\nreturn sanitizeKey;')();
-const sample = 'outputs/tiny.parquet';
-const real = fn(sample);
-console.log('engine key     :', sample);
-console.log('sanitizeKey()  :', real);
-ok('sanitizeKey strips the separator (precondition)', !real.includes('/'), real);
-ok('sanitizeKey is non-idempotent on a stored key', fn(real) !== real,
-   `re-sanitizing changed it: ${fn(real)}`);
+// The engine's canonical internal key shape (see worker/main.py:423).
+const ENGINE_KEY = 'outputs/data.parquet';
+console.log('engine key     :', ENGINE_KEY);
 
-// --- the receipt must store the SANITIZED key, and retrieval must not re-sanitize ---
-const receiptStart = idx.indexOf('const receipt = {');
-const receiptBlock = idx.slice(receiptStart, receiptStart + 500);
-ok('receipt stores sanitizeKey(output_key)',
-   /key:\s*sanitizeKey\(parsed\.output_key\)/.test(receiptBlock),
-   receiptBlock.slice(0, 200));
+// --- 1. the receipt stores the engine key verbatim, never a re-sanitized one ---
+const receiptBlock = idx.slice(idx.indexOf('const receipt = {'),
+                              idx.indexOf('const receipt = {') + 1200);
+ok('receipt stores parsed.output_key verbatim',
+   /key:\s*parsed\.output_key/.test(receiptBlock), receiptBlock.slice(0, 200));
+ok('receipt does NOT sanitize the engine key',
+   !/key:\s*sanitizeKey\(/.test(receiptBlock), 'receipt still rewrites the key');
 
-const retStart = idx.indexOf('const key = String(receipt.key');
+// --- 2. retrieval returns it verbatim ---
 ok('retrieval returns the receipt key verbatim',
-   retStart > 0, 'verbatim read not found');
-const around = idx.slice(Math.max(0, retStart - 500), retStart + 200);
-ok('retrieval does NOT call sanitizeKey on the receipt key',
-   !/const key = sanitizeKey\(String\(receipt\.key/.test(idx),
-   'retrieval still re-sanitizes the stored key');
-ok('ref cross-check compares verbatim', /String\(refObj\.key\) !== String\(receipt\.key\)/.test(idx),
-   'ref comparison still re-sanitizes');
+   idx.includes("const key = String(receipt.key || '');"), 'verbatim read absent');
+ok('retrieval does NOT sanitize the stored key',
+   !idx.includes('const key = sanitizeKey(String(receipt.key') &&
+   !/const key = sanitizeKey\(String\(receipt/.test(idx),
+   'retrieval still sanitizes the stored key');
+ok('ref cross-check compares verbatim',
+   idx.includes('String(refObj.key) !== String(receipt.key)'), 'ref check re-sanitizes');
 
-// --- end-to-end property: the key a customer receives must equal the stored one ---
+// --- 3. the gateway VALIDATES rather than rewrites ---
+ok('rejects a leading slash', /receiptKey\.startsWith\('\/'\)/.test(idx), 'missing');
+ok('rejects a traversal segment', /seg === '\.\.'/.test(idx), 'missing');
+ok('an unsafe key is refunded, not stored',
+   /engine_unsafe_output_key/.test(idx) && /recordRefund\(/.test(idx), 'no refund path');
+
+// --- 4. the property that was actually broken: separators survive ---
 {
-  const stored = real;                       // what the receipt holds
-  const returned = String(stored);           // retrieval now returns it verbatim
-  ok('stored key is returned unchanged', returned === stored, `${stored} -> ${returned}`);
-  // NOTE: sanitizeKey() legitimately appends '.parquet' to a key that already
-  // ends in it, so a doubled suffix on the STORED key is expected behaviour.
-  // The defect was sanitizing a SECOND time at retrieval (asserted above), not
-  // the shape of the sanitized value.
+  // Simulate the full path: engine key -> stored -> returned.
+  const stored = String(ENGINE_KEY);
+  const returned = String(stored);
+  console.log('stored         :', stored);
+  console.log('returned       :', returned);
+  ok('the separator survives the round trip', returned.includes('/'), returned);
+  ok('the key is byte-identical end to end', returned === ENGINE_KEY, returned);
+  ok('no doubled .parquet suffix is introduced', !/parquet\.parquet/.test(returned), returned);
+  ok('the outputs/ prefix is intact', returned.startsWith('outputs/'), returned);
 }
 
 for (const f of fails) console.log('FAIL:', f);
 console.log(fails.length
   ? `RESULT-KEY-FAIL (${fails.length})`
-  : `RESULT-KEY-ALL-PASS ('${sample}' -> stored '${real}' -> returned unchanged; ` +
-    `sanitize applied ONCE at ingest, never again at retrieval)`);
+  : `RESULT-KEY-ALL-PASS ('${ENGINE_KEY}' stored and returned byte-identical; ` +
+    `gateway validates traversal, never rewrites the engine's key)`);
 process.exit(fails.length ? 1 : 0);

@@ -970,15 +970,30 @@ export default {
       if (v && v.nonce && parsed && typeof parsed.output_key === 'string') {
         const receipt = {
           nonce: v.nonce, payer: v.payer || null, amountUsdc: tier.microUsdc,
-          // R29: store the key SANITIZED, here and only here, so retrieval can
-          // return it verbatim without re-deriving (and corrupting) it.
-          bucket: parsed.output_bucket || null, key: sanitizeKey(parsed.output_key),
+          // R30: store the key the ENGINE reported, verbatim. The engine is
+          // the authority on object naming -- it sanitizes per segment and
+          // preserves separators (internal keys are 'outputs/<name>'), so
+          // re-running the gateway's sanitizeKey() here corrupted a real key
+          // ('outputs/data.parquet' -> 'outputsdata.parquet.parquet') and paid
+          // customers could not fetch what they bought. The key is VALIDATED
+          // below (no traversal, no leading slash) and then stored unchanged.
+          bucket: parsed.output_bucket || null, key: parsed.output_key,
           settledTx: v.settledTx || null, at: Date.now(),
         };
         // R26: AWAIT the receipt, not waitUntil. Returning success while the
         // write is still in flight let a customer fetch their result
         // immediately and get 404 for a conversion they had already paid for.
         // If persistence fails the payer must not be told it succeeded.
+        // R30: refuse a key that could escape its prefix. The engine already
+        // sanitizes; this is defence in depth, not a rewrite.
+        const receiptKey = String(receipt.key || '');
+        if (!receiptKey || receiptKey.startsWith('/') ||
+            receiptKey.split('/').some((seg) => seg === '..' || seg === '.')) {
+          console.error('[gateway] engine returned an unsafe output_key for', v.nonce);
+          const refundedK = await recordRefund('engine_unsafe_output_key');
+          return json({ error: 'engine_result_incomplete',
+            refund: refundedK ? 'completed' : 'required' }, 502);
+        }
         try {
           await env.SECURITY_KV.put('result:' + v.nonce,
             JSON.stringify(receipt), { expirationTtl: 604800 });
