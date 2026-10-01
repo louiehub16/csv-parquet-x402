@@ -460,7 +460,7 @@ export async function verifyPayment(env, request, opts = {}) {
   }
   let settlement;
   try {
-    settlement = await opts.settle(payment);
+    settlement = await opts.settle(payment, { nonce: nonceHex, authorization: auth });
   } catch (e) {
     // R44: a transport error here is AMBIGUOUS (the transfer may have landed),
     // so KEEP the claim — releasing invites a double-delivery race against a

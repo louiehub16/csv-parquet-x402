@@ -18,6 +18,38 @@ export class ConsumedTxStore {
     const pathname = (url.pathname || "/").replace(/\/+$/, "") || "/";
     const method = (request.method || "GET").toUpperCase();
 
+    // R63: atomic refund claim — the single-storage-partition get/put makes
+    // "claim this refund" serializable, so two concurrent retries can never
+    // both execute the same payout.
+    if (method === "POST" && pathname === "/claim-refund") {
+      const body = await this.readBody(request);
+      if (!body || !body.nonce) return this.json({ ok: false, error: "invalid_json" }, 400);
+      const key = "refund:" + String(body.nonce);
+      const prior = await this.state.storage.get(key);
+      if (prior) {
+        const done = prior && prior.status === "refunded";
+        return this.json({ ok: true, alreadyRefunded: !!done }, 200);
+      }
+      await this.state.storage.put(key, {
+        nonce: String(body.nonce),
+        payer: body.payer || null,
+        amountUsdc: body.amountUsd != null ? body.amountUsd : (body.amountUsdc || 0),
+        reason: body.reason || "unspecified",
+        at: body.at || Date.now(),
+        status: "claimed",
+      });
+      return this.json({ ok: true, claimed: true }, 200);
+    }
+    if (method === "POST" && pathname === "/mark-refunded") {
+      const body = await this.readBody(request);
+      if (!body || !body.nonce) return this.json({ ok: false, error: "invalid_json" }, 400);
+      const key = "refund:" + String(body.nonce);
+      const rec = (await this.state.storage.get(key)) || { nonce: String(body.nonce) };
+      rec.status = "refunded";
+      rec.refundedAt = Date.now();
+      await this.state.storage.put(key, rec);
+      return this.json({ ok: true, refunded: true }, 200);
+    }
     if (method === "POST" && pathname === "/reserve-nonce") {
       return this.reserveNonce(request);
     }

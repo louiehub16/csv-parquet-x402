@@ -170,16 +170,77 @@ export default {
           ctx.waitUntil(reconcileDailyBudget(env, budgetTxId + ':reconcile', 0).catch(() => {}));
         }
       };
-      const recordRefund = (reason) => {
-        try {
-          ctx.waitUntil(env.SECURITY_KV.put('refund:' + v.nonce, JSON.stringify({
-            nonce: v.nonce, payer: v.payer, amountUsdc: tier.microUsdc,
-            reason, at: Date.now() }), { expirationTtl: 604800 }).catch(() => {}));
-        } catch (e) {}
+      // R60: REFUNDS ARE EXECUTED, NOT PROMISED. A settled-but-undelivered
+      // job enqueues an idempotent refund keyed by the nonce, attempts the
+      // facilitator refund immediately, and only then reports the result.
+      const recordRefund = async (reason) => {
+        // R66: stable key for this refund (status persistence + idempotency).
+        const refKey = 'refund:' + v.nonce;
+        // R63: claim the refund ATOMICALLY through the DO so two concurrent
+        // retries can never both execute the same refund.
+        if (!env.CONSUMED_TX_STORE) {
+          // Without the DO we cannot claim atomically — refuse to refund rather
+          // than risk double-spending the payer's money back.
+          console.error('[gateway] no DO: cannot claim refund atomically', v.nonce);
+          return false;
+        }
+        const dId = env.CONSUMED_TX_STORE.idFromName('singleton');
+        const dStub = env.CONSUMED_TX_STORE.get(dId);
+        const claim = await dStub.fetch('https://internal/claim-refund', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ nonce: v.nonce, payer: v.payer,
+            amountUsdc: tier.microUsdc, reason, at: Date.now() }),
+        }).catch(() => null);
+        if (!claim) return false;
+        const cj = await claim.json().catch(() => null);
+        if (!cj || cj.ok !== true) return false;      // already claimed/refunded
+        if (cj.alreadyRefunded === true) return true; // another attempt completed it
+        const record = { nonce: v.nonce, payer: v.payer, amountUsdc: tier.microUsdc,
+          reason, at: Date.now(), status: 'claimed' };
+        await env.SECURITY_KV.put('refund:' + v.nonce, JSON.stringify(record),
+          { expirationTtl: 604800 }).catch(() => {});
+        // Attempt execution now. The operator sweep (or the next call) retries
+        // any still-queued refund; the client is told the true state.
+        if (typeof env.X402_REFUND_URL === 'string' && env.X402_REFUND_URL) {
+          try {
+            const resp = await fetch(env.X402_REFUND_URL, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json',
+                Authorization: 'Bearer ' + (env.X402_REFUND_SECRET || '') },
+              body: JSON.stringify({ nonce: v.nonce, payer: v.payer,
+                amountUsdc: tier.microUsdc, reason }),
+            });
+            if (resp.ok) {
+              record.status = 'refunded';
+              await env.SECURITY_KV.put(refKey, JSON.stringify(record),
+                { expirationTtl: 604800 }).catch(() => {});
+              try {
+                const mId = env.CONSUMED_TX_STORE.idFromName('singleton');
+                await env.CONSUMED_TX_STORE.get(mId).fetch('https://internal/mark-refunded', {
+                  method: 'POST', headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ nonce: v.nonce }) });
+              } catch (_) {}
+              return true;
+            }
+          } catch (e) { /* stays queued for the sweep */ }
+        }
+        return false;
       };
+      // R62: HARD UPLOAD CEILING. formData() buffers the entire body in
+      // isolate memory, so reject oversize uploads BEFORE parsing. The public
+      // cap is ~100 MB; allow a small margin for multipart framing.
+      const MAX_UPLOAD_BYTES = 128 * 1024 * 1024;
+      const clen = Number(request.headers.get('content-length') || 0);
+      if (Number.isFinite(clen) && clen > MAX_UPLOAD_BYTES) {
+        return json({ error: 'upload_too_large', max_bytes: MAX_UPLOAD_BYTES }, 413);
+      }
+
       let form;
       try { form = await request.formData(); } catch (e) { return json({ error: 'bad_multipart' }, 400); }
       const file = form.get('file');
+      if (file && typeof file.size === 'number' && file.size > 128 * 1024 * 1024) {
+        return json({ error: 'upload_too_large', max_bytes: 128 * 1024 * 1024 }, 413);
+      }
       if (!file || typeof file === 'string') return json({ error: 'file_field_required' }, 400);
       const fname = (file.name || '').toLowerCase();
       if (!/\.(csv|tsv|txt)$/.test(fname)) return json({ error: 'unsupported_extension' }, 400);
@@ -327,7 +388,7 @@ export default {
         sizeBytes: file.size, // R46: price bound to the measured upload
         // R54: settlement is PART of verification — ok:true only after a
         // confirmed transfer AND a consumed nonce.
-        settle: async () => {
+        settle: async (_payment, info) => {
           if (!cdpConfigured(env)) return { ok: false, reason: 'settlement_not_configured' };
           const hdrB64 = request.headers.get('PAYMENT-SIGNATURE')
             || request.headers.get('X-PAYMENT') || '';
@@ -336,8 +397,18 @@ export default {
           if (r.ok !== true) return { ok: false, reason: r.reason, settledUnknown: r.settledUnknown };
           if (!/^0x[0-9a-fA-F]{64}$/.test(String(r.settledTx || '')))
             return { ok: false, reason: 'settle_tx_unproven' };
-          try { await consumeNonce(env, v0Nonce); }
-          catch (e) { return { ok: false, reason: 'nonce_consumption_failed' }; }
+          const burnNonce = (info && info.nonce) || v0Nonce;
+          // R59: if the burn fails the transfer is STILL COLLECTED — report
+          // success and record a durable audit note. Never tell the verifier
+          // "not paid" (that would let the authorization be retried).
+          // R61: burn failure is TERMINAL. The authorization would stay
+          // replayable, so we must not dispatch it: report failure, and the
+          // gateway's refund path compensates the payer.
+          try { await consumeNonce(env, burnNonce); }
+          catch (e) {
+            console.error('[gateway] nonce burn failed post-settlement:', (e && e.message) || e);
+            return { ok: false, reason: 'nonce_consumption_failed', terminal: true };
+          }
           return { ok: true, settledTx: r.settledTx, settledFrom: r.settledFrom,
             settledTo: r.settledTo, settledAmountUsdc: r.settledAmountUsdc,
             settledNonce: r.settledNonce };
@@ -431,8 +502,8 @@ export default {
                     } catch (_) {}
                   })());
                 }
-                recordRefund('gateway_timeout');
-                return json({ error: 'gateway_timeout' }, 504);
+                const refunded = await recordRefund('gateway_timeout');
+                return json({ error: 'gateway_timeout', refund: refunded ? 'completed' : 'queued' }, 504);
               }
               // R24 + OX-ALPHA: only a genuine network drop that occurs before
               // RunPod accepted (upstream_unreachable) guarantees no compute was
@@ -456,8 +527,8 @@ export default {
             } catch (_) {}
           })());
         }
-              recordRefund('upstream_unreachable');
-                return json({ error: 'upstream_unreachable' }, 502);
+              const refundedU = await recordRefund('upstream_unreachable');
+                return json({ error: 'upstream_unreachable', refund: refundedU ? 'completed' : 'queued' }, 502);
             }
       clearTimeout(timeoutId);
       if (request.signal) request.signal.removeEventListener('abort', onAbort);
@@ -485,8 +556,8 @@ export default {
         // Never relay upstream error bodies: platform messages can embed
         // request ids, storage endpoints or signed URLs. Generic error only;
         // details stay in worker logs (observability streams the raw tail).
-        recordRefund('upstream_error');
-        return json({ error: 'upstream_error', upstream_status: upstream.status, refundable: true }, 502);
+        const refundedE = await recordRefund('upstream_error');
+        return json({ error: 'upstream_error', upstream_status: upstream.status, refund: refundedE ? 'completed' : 'queued' }, 502);
       }
       const text = await upstream.text();
       let parsed;
@@ -512,12 +583,16 @@ export default {
             } catch (_) {}
           })());
         }
-        recordRefund('upstream_error');
-        return json({ error: 'upstream_error', upstream_status: upstream.status, refundable: true }, 502);
+        const refundedE = await recordRefund('upstream_error');
+        return json({ error: 'upstream_error', upstream_status: upstream.status, refund: refundedE ? 'completed' : 'queued' }, 502);
       }
-      const ALLOWED = ['status','output_bucket','output_key','rows','skipped_columns','skipped_rows','drift_fallback','duration_s','estimated_cost_usd','download_url','warning'];
+      const ALLOWED = ['status','output_bucket','output_key','rows','skipped_columns','skipped_rows','drift_fallback','duration_s','estimated_cost_usd','warning'];
       const body = {};
       for (const k of ALLOWED) if (parsed[k] !== undefined) body[k] = parsed[k];
+      // R64: do NOT relay the engine's presigned download_url — the signed
+      // query string IS a bearer credential. Advertise the controlled endpoint.
+      if (parsed.download_url) body.download_via = '/v1/compress/result?ref=' + encodeURIComponent(JSON.stringify({
+        key: parsed.output_key, bucket: parsed.output_bucket }));
       if (v && v.settledTx) body.settled_tx = v.settledTx;
       else if (v && v.settlePending) body.settle_pending = true;
       // OX-ALPHA: settle the gate 8.5 estimate against the engine-reported
@@ -574,7 +649,21 @@ export default {
           ctx.waitUntil(reconcileDailyBudget(env, budgetTxId + ':reconcile', 0).catch(() => {}));
         }
       } catch (_) {}
+      let refundFail = false;
+      let refundQueued = false;
       try {
+        if (paymentSettled && v && v.nonce) {
+          // R65/R67: the payer paid and got nothing. A refund MUST be durably
+          // recorded; if that fails we report 'required' so the operator
+          // incident is explicit rather than a silent promise.
+          const ok = await recordRefund('internal_error_after_settlement');
+          refundFail = !ok;
+          refundQueued = ok;
+          if (refundFail) {
+            console.error('[gateway] CRITICAL refund not recorded for', v.nonce,
+              '— operator action required');
+          }
+        }
         // R55: a settled payment was COLLECTED — never release it.
         if (env.CONSUMED_TX_STORE && v && v.nonce && !paymentSettled && !upstreamDispatched) {
           const id2 = env.CONSUMED_TX_STORE.idFromName('singleton');
@@ -583,10 +672,11 @@ export default {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ nonce: v.nonce }) });
         }
-        if (paymentSettled) recordRefund('internal_error_after_settlement');
+        if (paymentSettled) await recordRefund('internal_error_after_settlement');
       } catch (_) {}
       console.error('[gateway] internal_error:', (e && e.stack) || e);
-      return json({ error: 'internal_error' }, 500);
+      return json({ error: 'internal_error',
+        refund: paymentSettled ? (refundQueued ? 'queued' : 'required') : undefined }, 500);
     }
   },
 };
