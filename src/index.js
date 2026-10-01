@@ -788,10 +788,22 @@ export default {
 
       // (9) UPSTREAM DISPATCH — build the outbound form and the timeout/
       //     disconnect wiring the fetch below depends on.
-      const uploadName = safeName.endsWith('.parquet')
-        ? safeName.slice(0, -'.parquet'.length).replace(/\.(csv|tsv|txt)$/i, '') +
-          (fname.match(/\.(csv|tsv|txt)$/) || ['.csv'])[0]
-        : safeName;
+      // R44: the output key was derived ONLY from the sanitized filename, so two
+      // concurrent jobs uploading `data.csv` targeted the SAME object -- one
+      // silently overwrote the other, and a payer could be served another
+      // customer's file. Give every job a unique stem built from the paid
+      // authorization nonce, so keys are collision-free across tenants and
+      // retries. The nonce is unique per payment (it is burned after success).
+      const jobStem = (v && v.nonce ? String(v.nonce).replace(/^0x/, '').slice(0, 16)
+                                      : crypto.randomUUID().replace(/-/g, '').slice(0, 16));
+      const baseStem = safeName.endsWith('.parquet')
+        ? safeName.slice(0, -'.parquet'.length).replace(/\.(csv|tsv|txt)$/i, '')
+        : safeName.replace(/\.(csv|tsv|txt)$/i, '');
+      const extMatch = fname.match(/\.(csv|tsv|txt)$/i);
+      const ext = extMatch ? extMatch[0] : '.csv';
+      // <jobId>-<original stem><ext>: still recognizable, still ends in the
+      // real input extension, and unique per paid job.
+      const uploadName = `${jobStem}-${baseStem}${ext}`;
       const outForm = new FormData();
       outForm.append('file', new File([file], uploadName), uploadName);
       if (dest && dest.endpoint_url) outForm.append('target_destination', JSON.stringify(dest));
