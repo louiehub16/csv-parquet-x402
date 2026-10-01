@@ -249,6 +249,20 @@ export async function cdpVerifyAndSettle(env, paymentHeaderB64, resourceName, mi
   const payload = decodePaymentPayload(paymentHeaderB64);
   if (!payload) return { mode: 'cdp', ok: false, retryable: false, reason: 'malformed_payment_payload' };
 
+  // R28: resolve the authorization ONCE, from the correct envelope depth.
+  // `payload` is the whole decoded x402 envelope (it carries `accepted` /
+  // `accepts` at its ROOT), so the TransferWithAuthorization lives at
+  // payload.payload.authorization. The previous code read only
+  // payload.authorization, missed the real location, and fell through to a root
+  // fallback that does not exist -- so payer/settledFrom/settledNonce all came
+  // back null on SUCCESSFUL payments.
+  const authEnvelope = (payload && payload.payload && payload.payload.authorization
+    && typeof payload.payload.authorization === 'object')
+    ? payload.payload.authorization
+    : ((payload && payload.authorization && typeof payload.authorization === 'object')
+      ? payload.authorization
+      : null);
+
   // Requirements may arrive as a singular `accepted` object (v2 standard) or an
   // `accepts` array (early SDK shape). Read whichever is present.
   const reqObj = (payload.accepted && typeof payload.accepted === 'object' && !Array.isArray(payload.accepted))
@@ -379,9 +393,10 @@ export async function cdpVerifyAndSettle(env, paymentHeaderB64, resourceName, mi
       return { mode: 'cdp', ok: false, retryable: false, settledUnknown: true, reason: 'settle_unconfirmed' };
     }
 
-    // Payer may appear at the envelope root or inside the authorization.
-    const payer = (payload.authorization && payload.authorization.from)
-      ? String(payload.authorization.from).toLowerCase()
+    // R28: read the payer from the resolved authorization (both envelope depths
+    // handled above), falling back to a root `from` for exotic shapes.
+    const payer = (authEnvelope && authEnvelope.from)
+      ? String(authEnvelope.from).toLowerCase()
       : (payload.from && typeof payload.from === 'string'
         ? payload.from.toLowerCase() : null);
 
@@ -405,9 +420,9 @@ export async function cdpVerifyAndSettle(env, paymentHeaderB64, resourceName, mi
       // Prefer what the facilitator actually reported settled; fall back to the
       // authorization when the response omits it.
       settledFrom: (sData.payer || sData.from || payer) || null,
-      settledTo: sData.payTo || sData.to || (payload.authorization && payload.authorization.to) || reqObj.payTo || null,
+      settledTo: sData.payTo || sData.to || (authEnvelope && authEnvelope.to) || reqObj.payTo || null,
       settledAmountUsdc: (sData.amount != null ? String(sData.amount) : rawAmount) || null,
-      settledNonce: sData.nonce || (payload.authorization && payload.authorization.nonce) || null,
+      settledNonce: sData.nonce || (authEnvelope && authEnvelope.nonce) || null,
       // We DID submit to the facilitator, so this is never 'definitely not submitted'.
       definitelyNotSubmitted: false,
     };

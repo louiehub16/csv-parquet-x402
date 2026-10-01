@@ -50,6 +50,11 @@ CASES = [
      "sk-live-abcdef123456", "generic api key"),
     ("x_amz_security_token: FwoGZXIvYXdzEAnotherExampleToken9876",
      "FwoGZXIvYXdzEAnotherExampleToken9876", "x-amz security token"),
+    # R28: UNLABELED 40-char secret (classic AWS secret-key shape). This is what
+    # _BARE_SECRET_RE was written for in R18 but never applied to.
+    ("An error occurred (InvalidAccessKeyId): the request signature we calculated "
+     "does not match. wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY did not match",
+     "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", "unlabeled 40-char secret"),
 ]
 
 
@@ -73,11 +78,19 @@ def main():
     if "schema drift" not in benign:
         failures.append(f"over-redacted benign text: {benign!r}")
 
+    # R28: the full response path is mask_secret(redact_message(err)). Verify the
+    # COMBINED result leaks no part of a bare secret (mask_secret alone would
+    # expose first4...last4).
+    combined_src = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    combined = mod.mask_secret(redact(combined_src))
+    if "wJalr" in combined or "YKEY" in combined or combined_src in combined:
+        failures.append(f"mask_secret(redact()) leaks secret fragments: {combined!r}")
+
     for f in failures:
         print("FAIL:", f)
     if not failures:
-        print(f"REDACTION-ALL-PASS ({len(CASES)} secret shapes masked, "
-              f"URL masked, benign text preserved)")
+        print(f"REDACTION-ALL-PASS ({len(CASES)} secret shapes masked incl. unlabeled "
+              f"40-char, URL masked, benign text preserved, combined path leaks nothing)")
     return 1 if failures else 0
 
 

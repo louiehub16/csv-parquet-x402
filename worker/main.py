@@ -69,6 +69,11 @@ def redact_message(err) -> str:
     msg = _BEARER_RE.sub("Bearer <redacted>", msg)
     # Keep the label (it is diagnostic) but never the value.
     msg = _CRED_ASSIGN_RE.sub(lambda m: f"{m.group(1)}=<redacted>", msg)
+    # R28: apply the bare-secret rule. It was defined in R18 but never wired in,
+    # so an UNLABELED 40-character secret (classic AWS secret-key shape) passed
+    # through untouched and mask_secret() then exposed its first and last 4
+    # characters in the response body.
+    msg = _BARE_SECRET_RE.sub("<redacted-secret>", msg)
     return msg
 
 
@@ -313,7 +318,27 @@ class HyperStreamWriter(io.RawIOBase):
             pass
 
 
+def _assert_resolved_public(host: str) -> str:
+    """Re-validate what a dialer would connect to RIGHT NOW (anti-rebinding).
+
+    validate_endpoint_url() ran earlier in the request; a DNS-rebinding attacker
+    can answer public then private. Re-resolving here narrows the window to
+    milliseconds and fails the job if the address is not public. It is not a
+    substitute for connection pinning, which urllib3 does not expose cleanly.
+    """
+    return _resolve_all_public(host)
+
+
 def make_client(endpoint_url, access_key, secret_key):
+    # R28: validate the addresses boto3 is about to use, not just the host text.
+    try:
+        _host = urlparse(endpoint_url).hostname
+    except Exception:
+        _host = None
+    if _host:
+        why_now = _assert_resolved_public(_host)
+        if why_now:
+            raise ValueError("endpoint resolves to a non-public address")
     return boto3.client(
         "s3", endpoint_url=endpoint_url,
         aws_access_key_id=access_key, aws_secret_access_key=secret_key,
@@ -357,6 +382,19 @@ async def compress(file: UploadFile, target_destination: str = Form(None)):
                 return JSONResponse(status_code=400, content={
                     "status": "error",
                     "message": f"target_destination endpoint rejected: {why}."})
+            # R28: re-check the resolved addresses now. A rebinding host can
+            # pass the check above and resolve privately by the time boto3
+            # connects; this second look fails the job instead of dialing it.
+            try:
+                _h = urlparse(custom["endpoint_url"]).hostname
+            except Exception:
+                _h = None
+            if _h:
+                why2 = _assert_resolved_public(_h)
+                if why2:
+                    return JSONResponse(status_code=400, content={
+                        "status": "error",
+                        "message": f"target_destination endpoint rejected: {why2}."})
             endpoint = custom["endpoint_url"]
             ak, sk = custom["aws_access_key_id"], custom["aws_secret_access_key"]
             bucket = custom["bucket_name"]
