@@ -625,6 +625,20 @@ export default {
             // facilitator guarantees nothing was submitted, else keep it and
             // queue a refund.
             if (r.definitelyNotSubmitted === true) {
+              // R35: the claim lives in CONSUMED_TX_STORE (the Durable Object),
+              // NOT in SECURITY_KV. Deleting a KV key left the DO claim
+              // consumed forever, so a payer whose payment was definitively
+              // rejected could never retry that authorization. Release through
+              // the DO, and keep the KV delete only as a legacy mirror.
+              try {
+                if (env.CONSUMED_TX_STORE) {
+                  const relStub = env.CONSUMED_TX_STORE.get(
+                    env.CONSUMED_TX_STORE.idFromName('singleton'));
+                  await relStub.fetch('https://internal/release-nonce', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ nonce: claimNonce }) });
+                }
+              } catch (_) {}
               try { await env.SECURITY_KV.delete('x402_nonce:' + claimNonce); } catch (_) {}
               return { ok: false, reason: r.reason, definitelyNotSubmitted: true };
             }
