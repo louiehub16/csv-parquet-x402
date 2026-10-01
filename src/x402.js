@@ -394,9 +394,10 @@ export async function verifyPayment(env, request, opts = {}) {
       if (sBi > HALF) throw new RangeError('high-s signature');
     }
     let recId;
-    // R43: accept the full recovery-id range. v may arrive as 0/1 or 27/28, and
-    // the 2/3 (x >= n) forms are mathematically valid -- rejecting them failed
-    // recovery for a valid signature instead of returning a wrong key.
+    // R43: accept the full 4-valued recovery id. 0/1 and 27/28 are the common
+    // encodings; 2/3 mark R.x >= n and are mathematically valid. The 27/28 form
+    // only encodes parity, so it is mapped to 0/1 (adding 2 would invent an
+    // overflow that the 27/28 encoding cannot express).
     if (vRaw === 27 || vRaw === 28) recId = vRaw - 27;
     else if (vRaw >= 0 && vRaw <= 3) recId = vRaw;
     else throw new RangeError('bad v');

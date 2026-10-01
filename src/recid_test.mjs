@@ -90,9 +90,40 @@ const toBytes32 = (n) => {
      '27/28 handling lost');
 }
 
+// --- the SIGNER must emit the overflow bit in its own position ---
+// R43b: the first fix only updated recover() and left the signer as
+// `recovery = (parity ^ (overflowed ? 1 : 0)) & 1`, which XORs the overflow bit
+// into the parity and masks it away -- so a signature with R.x >= n still
+// reported id 0/1. The bit must be emitted as (overflowed ? 2 : 0) | parity.
+{
+  const secp = readFileSync(new URL('./_secp256k1.js', import.meta.url), 'utf8');
+  const line = secp.split('\n').find((l) => l.includes('const recovery ='));
+  ok('the signer emits the overflow bit in its own position',
+     /\(overflowed\s*\?\s*2\s*:\s*0\)\s*\|\s*parity/.test(line || ''),
+     line ? line.trim() : 'signer recovery line not found');
+  ok('the signer no longer masks the id with & 1',
+     !/const recovery = [^;]*& 1;/.test(secp), 'still masks the recovery id');
+  ok('the low-s normalization still gates the parity inversion',
+     /normalized\s*\?\s*\(baseParity \^ 1\)\s*:\s*baseParity/.test(secp),
+     'parity inversion no longer depends on normalization');
+}
+
+// --- x402.js must not promote 27/28 to 2/3 (that encoding cannot express it) ---
+{
+  const x402 = readFileSync(new URL('./x402.js', import.meta.url), 'utf8');
+  const vBlock = x402.slice(x402.indexOf('let recId;'), x402.indexOf('let recId;') + 400);
+  ok('27/28 maps to 0/1 without adding an overflow bit',
+     /vRaw === 27 \|\| vRaw === 28\) recId = vRaw - 27;/.test(vBlock),
+     '27/28 mapping changed');
+  ok('the 27/28 mapping is not offset by 2',
+     !/vRaw - 27 \+ 2/.test(vBlock) && !/vRaw === 29 \|\| vRaw === 30/.test(vBlock),
+     '27/28 is being promoted to an overflow id it cannot express');
+}
+
 for (const f of fails) console.log('FAIL:', f);
 console.log(fails.length
   ? `R43-RECID-FAIL (${fails.length})`
-  : 'R43-RECID-ALL-PASS (ids 0/1 round-trip correctly; 2/3 accepted with the r+n ' +
-    'candidate; 4/7/-1/99 still refused; v parsing accepts 0..3 and 27/28)');
+  : 'R43-RECID-ALL-PASS (ids 0/1 round-trip; 2/3 accepted with the r+n candidate; ' +
+    'signer emits the overflow bit as (overflowed?2:0)|parity; 4/7/-1/99 refused; ' +
+    'v accepts 0..3 and 27/28 without inventing an overflow)');
 process.exit(fails.length ? 1 : 0);

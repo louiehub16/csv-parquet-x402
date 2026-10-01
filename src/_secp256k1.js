@@ -245,11 +245,16 @@ export async function signDigest(digest32, privBytes) {
     const normalized = s > N / 2n;
     if (normalized) s = N - s;
     // Recovery id for the (possibly) LOW-S-normalized signature.
-    // Unnormalized:  v = (R.y & 1) | (R.x > n ? 2 : 0)
+    //
+    // The full id is 4-valued: bit 1 is the y-parity (inverted only when the
+    // low-s flip actually negated the key) and bit 0 marks R.x >= n. R43: the
+    // overflow bit must be emitted in its own position -- XORing it into the
+    // parity and masking with & 1 collapsed ids 2/3 back to 0/1, so a verifier
+    // that honours them would recover the wrong key.
     const overflowed = R.x >= N;
     const baseParity = (R.y & 1n ? 1 : 0);
     const parity = normalized ? (baseParity ^ 1) : baseParity;
-    const recovery = (parity ^ (overflowed ? 1 : 0)) & 1;
+    const recovery = (overflowed ? 2 : 0) | parity;
     return { r, s, recovery };
   }
   throw new Error('signDigest: exhausted k candidates');
