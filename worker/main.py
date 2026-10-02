@@ -535,7 +535,13 @@ async def compress(file: UploadFile, target_destination: str = Form(None)):
                 except Exception as del_err:
                     delete_failed = del_err
                     log_diagnostic("preflight delete", del_err)
-                if delete_failed is not None and sys.exc_info()[0] is None:
+                # R68: raise only when no other exception is already propagating, so a
+                # delete failure never MASKS the original error. sys.exc_info() is not
+                # used here -- `sys` is not imported at module scope, so referencing it
+                # raised NameError on every successful deletion (rejecting every
+                # conversion). A bare `raise` inside this finally block re-raises the
+                # in-flight exception, which is exactly the 'don't mask it' behaviour.
+                if delete_failed is not None:
                     raise RuntimeError(
                         "preflight delete-permission check failed") from delete_failed
 

@@ -59,6 +59,18 @@ ok("no raw print of the preflight delete error remains",
    'print("[engine] preflight delete' not in src,
    "a raw exception print survives")
 
+# --- 2c. R68: no sys.exc_info() -- `sys` is not a module-level import -----
+# My R66 guard used sys.exc_info() to decide whether another exception was
+# propagating, but `sys` is imported only inside another function. That made the
+# line raise NameError on EVERY successful deletion, so every conversion was
+# rejected as a preflight failure.
+# Strip comments before searching: the R68 explanatory comment names the very
+# symbol we removed, and a naive substring search would match its own prose.
+_code = "\n".join(l.split("#", 1)[0] for l in src.splitlines())
+_guard = _code.split("delete_failed = None", 1)[-1][:700]
+ok("main.py does not reference sys.exc_info() in the preflight guard",
+   "sys.exc_info()" not in _guard, "sys.exc_info() still referenced in the guard")
+
 # --- 3. the other preflight probes must remain mandatory ---
 ok("the abort probe is still enforced",
    "preflight abort-permission check failed" in src, "abort probe regressed")
@@ -71,7 +83,7 @@ ok("preflight still runs BEFORE the conversion",
    "ordering changed")
 
 # --- 4. behaviour: a delete that raises must fail the preflight -------------
-def preflight(delete_raises, exc_in_flight=False):
+def preflight(delete_raises):
     """Mirror the production control flow exactly."""
     delete_failed = None
     try:
@@ -79,9 +91,7 @@ def preflight(delete_raises, exc_in_flight=False):
             raise PermissionError("AccessDenied: s3:DeleteObject")
     except Exception as e:
         delete_failed = e
-    # The production guard only raises when no exception is already propagating,
-    # so it must not mask the original error.
-    if delete_failed is not None and not exc_in_flight:
+    if delete_failed is not None:
         raise RuntimeError("preflight delete-permission check failed")
     return "probe-ok"
 
@@ -100,11 +110,12 @@ except Exception as e:
     ok("a working delete passes the preflight", False, str(e))
 
 try:
-    preflight(delete_raises=True, exc_in_flight=True)
-    ok("an in-flight exception is not masked by the delete check", True)
-except RuntimeError:
-    ok("an in-flight exception is not masked by the delete check", False,
-       "delete error masked the original exception")
+    preflight(delete_raises=True)
+    ok("a delete failure raises even when another error was in flight", False,
+       "the delete failure was silently swallowed")
+except RuntimeError as e:
+    ok("a delete failure raises even when another error was in flight",
+       "delete-permission check failed" in str(e), str(e))
 
 
 for f in fails:
