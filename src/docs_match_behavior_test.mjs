@@ -102,6 +102,35 @@ for (const [name, text] of [
      !/public(ly)? (readable|available|accessible)/i.test(text), 'claims public access');
 }
 
+// --- R69: the openapi 402 header example must match the LIVE manifest -------
+// It documented a FLAT shape (scheme/network/asset/payTo at the root, resource
+// as a string) that contradicted both buildChallenge() and this file's own 402
+// response description, so a client written from it would mis-parse the header.
+{
+  const at = openapi.indexOf('"PAYMENT-REQUIRED"');
+  const hdr = at >= 0 ? openapi.slice(at, at + 1500) : '';
+  // The file is raw JSON text, so quotes inside the description are escaped (\").
+  // Strip the escapes before matching, otherwise a correctly nested example
+  // reads as flat.
+  const flat = hdr.replace(/\\/g, '');
+  ok('the PAYMENT-REQUIRED header is documented at all', hdr.length > 0, 'not found');
+  ok('the example nests resource as an OBJECT',
+     /resource"?\s*:\s*\{\s*"?url/.test(flat), 'resource is documented flat');
+  ok('the example shows the accepts[] array', /accepts/.test(flat), 'accepts[] missing');
+  ok('no flat top-level scheme/payTo layout is documented',
+     !/\{\s*\"?x402Version\"?\s*:\s*2\s*,\s*\"?scheme/.test(flat),
+     'a flat manifest is still documented');
+  ok('amount is nested under accepts[], not at the root',
+     !/\{\s*\"?x402Version\"?\s*:\s*2[^}]*?\"?amount\"?/.test(flat),
+     'amount documented at the manifest root');
+
+  // The shipped code must produce exactly this shape.
+  const x402src = readFileSync(new URL('./x402.js', import.meta.url), 'utf8');
+  ok('buildChallenge really nests resource and accepts',
+     /resource:\s*\{\s*url,\s*description\s*\}/.test(x402src) &&
+     /accepts:\s*\[\{/.test(x402src), 'the code shape differs from the docs');
+}
+
 for (const f of fails) console.log('FAIL:', f);
 console.log(fails.length
   ? `R47-DOCS-FAIL (${fails.length})`
