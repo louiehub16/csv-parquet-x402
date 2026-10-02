@@ -153,6 +153,27 @@ const getResult = async (env, query = '') => {
   console.log('payer meta ->', res.status, JSON.stringify(body).slice(0, 150));
   ok('meta mode returns JSON', res.status === 200 && body.status === 'ready', body);
   ok('meta mode reports the size', typeof body.size === 'number', body.size);
+  // R60: download_via must be a CLEAN, parseable URL. It previously appended
+  // an English instruction into the query string, so any client parsing it got a
+  // malformed link. Assert it parses and that the prose lives elsewhere.
+  const dv = body.download_via;
+  ok('meta mode returns a download_via URL', typeof dv === 'string' && dv.length > 0, dv);
+  let parsedOk = false, parseErr = null;
+  try {
+    const u = new URL('https://gw.test' + dv);
+    const r = u.searchParams.get('ref');
+    // the ref must round-trip as JSON, and nothing but real params may be there
+    const obj = JSON.parse(r);
+    parsedOk = !!obj && obj.key === 'outputs/paid.parquet' && obj.bucket === 'internal-bucket';
+    ok('the ref query param round-trips as JSON', parsedOk, r);
+    for (const [k, v] of u.searchParams) {
+      ok(`query param "${k}" carries no prose`, !/[()]|\bGET\b|\bwith\b/i.test(v), v);
+    }
+  } catch (e) { parseErr = e.message; }
+  ok('download_via parses as a URL with the expected params', parsedOk, parseErr || dv);
+  ok('the retrieval instruction is in a separate field',
+     typeof body.how_to_retrieve === 'string' &&
+     /PAYMENT-SIGNATURE/.test(body.how_to_retrieve), body.how_to_retrieve);
   ok('meta mode does not stream the payload',
      !body.bucket || body.key === 'outputs/paid.parquet', body);
 }

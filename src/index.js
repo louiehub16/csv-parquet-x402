@@ -247,13 +247,19 @@ export default {
             const object = await fetchR2Object(env, key);
             // ?meta=1 returns the JSON descriptor without transferring bytes.
             if (url.searchParams.get('meta') === '1') {
+              // R60: download_via must be a CLEAN, parseable URL. It previously
+              // appended an English instruction into the query string, so any
+              // client parsing it received a malformed link. The instruction now
+              // lives in `how_to_retrieve` instead.
+              const refParam = encodeURIComponent(JSON.stringify({ key, bucket }));
               return json({
                 status: 'ready', bucket, key,
                 size: typeof object.size === 'number' ? object.size : null,
                 settled_tx: receipt.settledTx || null,
-                download_via: url.pathname + '?ref=' +
-                  encodeURIComponent(JSON.stringify({ key, bucket })) +
-                  '&meta=0 (GET this with your PAYMENT-SIGNATURE to stream the file)',
+                download_via: url.pathname + '?ref=' + refParam,
+                how_to_retrieve:
+                  'GET download_via with the same PAYMENT-SIGNATURE header you '
+                  + 'paid with; the response streams the Parquet file.',
                 note: 'Objects are deleted ~24h after conversion; fetch before then.',
               });
             }
