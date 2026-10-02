@@ -332,10 +332,17 @@ export async function cdpVerifyAndSettle(env, paymentHeaderB64, resourceName, mi
     return { mode: 'cdp', ok: false, retryable: false, reason: 'underpayment' };
   }
 
+  // R65: stage tracking. Without it the catch-all could not tell a failure
+  // BEFORE /settle was submitted from one after, and reported every exception as
+  // settledUnknown -- which makes the gateway REFUND an authorization the payer
+  // never paid for (a fabricated refund, costing the merchant).
+  let stage = 'verify';
+  let settleSubmitted = false;
   try {
     // ---- STEP 1: VERIFY ----
     const jwtV = await buildCdpJwt(env, 'POST', '/platform/v2/x402/verify');
-    if (!jwtV) return { mode: 'cdp', ok: false, retryable: true };
+    if (!jwtV) return { mode: 'cdp', ok: false, retryable: true,
+      definitelyNotSubmitted: true, stage, reason: 'verify_jwt_unavailable' };
     const verifyRes = await fetch(`${CDP_BASE}/verify`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${jwtV}`, 'Content-Type': 'application/json' },
@@ -388,6 +395,10 @@ export async function cdpVerifyAndSettle(env, paymentHeaderB64, resourceName, mi
         definitelyNotSubmitted: true, stage: 'settle-preflight',
         reason: 'settle_jwt_unavailable' };
     }
+    // R65: from this point the settle request IS being submitted, so any later
+    // failure is genuinely ambiguous and must not be reported as not-submitted.
+    settleSubmitted = true;
+    stage = 'settle';
     const settleRes = await fetch(`${CDP_BASE}/settle`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${jwtS}`, 'Content-Type': 'application/json' },
@@ -477,7 +488,16 @@ export async function cdpVerifyAndSettle(env, paymentHeaderB64, resourceName, mi
     // caller treat this as a clean "not paid" and re-serve the same
     // authorization. Report it as UNSETTLED: the gateway must stop and require a
     // fresh payment, rather than falling back to the offline path.
+    // R65: an exception BEFORE the settle request was submitted means nothing
+    // moved -- reporting settledUnknown here would fabricate a refund. Only a
+    // post-submit failure is genuinely ambiguous.
+    if (!settleSubmitted) {
+      console.error('[cdp] pre-settle failure, nothing submitted:', (e && e.message) || e);
+      return { mode: 'cdp', ok: false, retryable: true, stage,
+        definitelyNotSubmitted: true, reason: 'pre_settle_failure' };
+    }
     console.error('[cdp] settlement outcome ambiguous:', (e && e.message) || e);
-    return { mode: 'cdp', ok: false, retryable: false, reason: 'settlement_ambiguous', settledUnknown: true };
+    return { mode: 'cdp', ok: false, retryable: false, reason: 'settlement_ambiguous',
+      stage, settledUnknown: true };
   }
 }

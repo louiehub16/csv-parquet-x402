@@ -51,6 +51,23 @@ const ok = (label, cond, got) => { if (!cond) fails.push(`${label} — got ${JSO
   // settledUnknown must now only appear AFTER a settle request was submitted.
   const unknownSites = [...cdp.matchAll(/settledUnknown:\s*true/g)].map((m) => m.index);
   const settleCall = cdp.indexOf('`${CDP_BASE}/settle`');
+  // R65: stage tracking. The catch-all must distinguish a failure BEFORE the
+  // settle request was submitted (nothing moved -> no refund) from one after
+  // (genuinely ambiguous -> refund path).
+  ok('the adapter tracks the current stage',
+     /let stage = 'verify'/.test(cdp), 'no stage variable');
+  ok('it tracks whether the settle request was submitted',
+     /let settleSubmitted = false/.test(cdp), 'no submit flag');
+  ok('the flag is set immediately before the settle fetch',
+     cdp.indexOf('settleSubmitted = true;') < cdp.indexOf('`${CDP_BASE}/settle`'),
+     'flag set after the request');
+  ok('a PRE-submit exception is definitelyNotSubmitted (no fabricated refund)',
+     /if \(!settleSubmitted\)[\s\S]{0,400}definitelyNotSubmitted:\s*true/.test(cdp),
+     'pre-submit failure still reported ambiguous');
+  ok('a POST-submit exception stays settledUnknown',
+     /settleSubmitted = true[\s\S]*?settledUnknown:\s*true/.test(cdp),
+     'post-submit failure no longer ambiguous');
+
   ok('settledUnknown only appears after the settle request is built',
      unknownSites.length > 0 && unknownSites.every((i) => i > settleCall),
      `${unknownSites.length} sites, first at ${unknownSites[0]}, settle at ${settleCall}`);
