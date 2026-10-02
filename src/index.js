@@ -866,7 +866,13 @@ export default {
             if (addr(log.topics[1]).toLowerCase() !== String(expected.from).toLowerCase()) continue;
             if (addr(log.topics[2]).toLowerCase() !== String(expected.to).toLowerCase()) continue;
             let amount; try { amount = BigInt(log.data || '0x0'); } catch (e) { continue; }
-            if (amount < BigInt(expected.value)) continue;
+            // R63: require EXACT equality. `amount < expected` accepted a
+            // facilitator transaction that collected MORE than the signed
+            // authorization, while the metadata still reported the expected
+            // amount -- delivering work against a payment that did not match
+            // what the payer authorized. An EIP-3009 transfer of THIS
+            // authorization is always exactly auth.value, so > is never valid.
+            if (amount !== BigInt(expected.value)) continue;
             sawTransfer = true;
             // R23: the AuthorizationUsed log can appear BEFORE or AFTER this
             // Transfer, so the pairing is decided AFTER the loop. Deciding it
