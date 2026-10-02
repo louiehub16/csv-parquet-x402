@@ -48,6 +48,17 @@ ok("the bare `except: pass` swallow is gone",
    "                    pass" not in src,
    "swallow still present")
 
+# --- 2b. R67: the delete error must go through the redacting logger --------
+# My R66 fix printed the raw botocore exception, which can carry S3 endpoints
+# or credential material into logs. Every engine diagnostic must go through
+# log_diagnostic(), which redacts URLs and key material.
+ok("the delete failure is logged via log_diagnostic (redacting)",
+   'log_diagnostic("preflight delete", del_err)' in src,
+   "raw print or missing redacting logger")
+ok("no raw print of the preflight delete error remains",
+   'print("[engine] preflight delete' not in src,
+   "a raw exception print survives")
+
 # --- 3. the other preflight probes must remain mandatory ---
 ok("the abort probe is still enforced",
    "preflight abort-permission check failed" in src, "abort probe regressed")
