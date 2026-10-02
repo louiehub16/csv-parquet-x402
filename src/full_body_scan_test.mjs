@@ -20,7 +20,10 @@ const ok = (label, cond, got) => { if (!cond) fails.push(`${label} — got ${JSO
   const src = readFileSync(new URL('./index.js', import.meta.url), 'utf8');
   ok('a full-body scan exists (file.arrayBuffer, not a prefix slice)',
      /await file\.arrayBuffer\(\)/.test(src), 'no full-body read');
-  const i = src.indexOf('await file.arrayBuffer()');
+  // R64 added a full-body UTF-8 validation block ahead of this one, so
+  // anchor on the (5.1) scan specifically rather than the first match.
+  const scan = src.indexOf('FULL-BODY BINARY SCAN');
+  const i = src.indexOf('await file.arrayBuffer()', scan);
   const block = src.slice(i, i + 1400);
   ok('it scans every byte for NUL, not just the head',
      /for \(let i = 0; i < all\.length; i\+\+\)/.test(block) && /all\[i\] === 0x00/.test(block),

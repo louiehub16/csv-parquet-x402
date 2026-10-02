@@ -587,6 +587,24 @@ export default {
           return json({ error: 'no_delimiters_detected' }, 400);
       }
 
+      // (5.05) FULL-BODY UTF-8 VALIDATION (R64) -- the sniff above decodes only
+      // the first 1 MiB, so invalid UTF-8 past that boundary reached paid
+      // processing. formData() has already buffered the whole upload, so validate
+      // all of it before any money moves. Decoding is the cheapest way to catch
+      // every invalid sequence in one pass.
+      {
+        const whole = new Uint8Array(await file.arrayBuffer());
+        if (whole.length > 0) {
+          try {
+            // fatal:true throws on the first invalid sequence anywhere in the file
+            new TextDecoder('utf-8', { fatal: true }).decode(whole);
+          } catch (e) {
+            console.error('[gateway] invalid UTF-8 in the full upload');
+            return json({ error: 'invalid_utf8' }, 400);
+          }
+        }
+      }
+
       // (5.1) FULL-BODY BINARY SCAN (R45) — the sniff above deliberately reads
       // only the first 1 MB to stay cheap, and the engine re-checks only that
       // same prefix. A NUL byte or embedded archive magic PAST that boundary

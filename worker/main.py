@@ -181,7 +181,11 @@ def validate_endpoint_url(url: str) -> str:
     return _resolve_all_public(parsed.hostname)
 
 
-DELIMS = (",", ";", "\t")
+# R64: newline is a valid delimiter for delimited text and the gateway
+# accepts it, but it was never a sniff candidate -- so a newline-delimited file
+# fell through to a wrong delimiter and was silently corrupted. Count it last so
+# comma/semicolon/tab still win when they are genuinely more frequent.
+DELIMS = (",", ";", "\t", "\n", "\r")
 
 
 def choose_delimiter(filename: str, fobj) -> str:
