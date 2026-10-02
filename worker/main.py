@@ -525,10 +525,19 @@ async def compress(file: UploadFile, target_destination: str = Form(None)):
             finally:
                 # R25(F): always clean up the completed probe object, even if a
                 # later probe step raises.
+                # R66: a swallowed delete let credentials WITHOUT DeleteObject
+                # pass preflight and leak one probe object per conversion. The
+                # preflight exists to prove the FULL permission set the output
+                # path needs -- delete is part of it -- so a failure is fatal.
+                delete_failed = None
                 try:
                     probe.delete_object(Bucket=bucket, Key=probe_key)
-                except Exception:
-                    pass
+                except Exception as del_err:
+                    delete_failed = del_err
+                    print("[engine] preflight delete failed:", del_err, flush=True)
+                if delete_failed is not None and sys.exc_info()[0] is None:
+                    raise RuntimeError(
+                        "preflight delete-permission check failed") from delete_failed
 
             # R22: DEDICATED abort-permission probe — create a second real MPU
             # that exists only to be successfully aborted. Credentials lacking
