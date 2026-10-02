@@ -39,6 +39,11 @@
     //   R2_ENDPOINT_URL, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME,
     //   CDP_API_KEY_ID, CDP_API_KEY_SECRET (facilitator verify/settle;
     //   cdp.js reads CDP_API_KEY_SECRET)
+    // R62: the bucket this Worker is bound to. Result retrieval streams only when
+    // the receipt names THIS bucket; a BYO job's object lives in the caller's own
+    // bucket and must be fetched with their own credentials. This value MUST
+    // match r2_buckets[RESULTS].bucket_name and R2_BUCKET_NAME (engine side).
+    "RESULTS_BUCKET_NAME": "REPLACE_WITH_R2_BUCKET_NAME",
     // SpendGuard knobs (hardcoded fallbacks live in src/spendguard.js):
     "SG_MIN_BALANCE": "2.00",
     // Ceiling matches the max internal-tier price for a single file (10 GiB @ $0.10/GB = $1.00)

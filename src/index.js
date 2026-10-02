@@ -240,7 +240,13 @@ export default {
         // credentials it must never hold. This runs ONLY after a durable receipt
         // exists and the EIP-712 payer has been recovered and matched to it, and
         // the key comes from the RECEIPT -- never from caller input.
-        if (env.RESULTS) {
+        // R62: only stream when the object is actually in OUR bucket. A BYO job
+        // writes to the caller's own bucket, so looking it up in the RESULTS
+        // binding 404/503'd and the payer could never retrieve a BYO result.
+        const internalBucket = String(env.RESULTS_BUCKET_NAME || '').toLowerCase();
+        const isInternal = !!env.RESULTS &&
+          (!internalBucket || bucket.toLowerCase() === internalBucket);
+        if (isInternal) {
           const filename = key.split('/').pop() || 'result.parquet';
           const disposition = 'attachment; filename="' + filename.replace(/[^\w.\-]/g, '_') + '"';
           try {

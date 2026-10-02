@@ -45,6 +45,7 @@ const RESULTS = {
 };
 
 const baseEnv = {
+  RESULTS_BUCKET_NAME: 'internal-bucket',
   MERCHANT_WALLET_ADDRESS: '0x795dCA28d0e8a0E5d19D689163f125a7da1D0B83',
   CDP_API_KEY_ID: 'k',
   CDP_API_KEY_SECRET: '4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318',
@@ -85,7 +86,16 @@ const getResult = async (env, query = '') => {
   ok('it uses the binding, not hand-rolled signing',
      /bucket\.get\(key\)/.test(src) && !/createPresignedUrl/.test(src),
      'presigning is not a real R2 binding capability');
-  ok('the stream is gated on env.RESULTS', /if \(env\.RESULTS\)/.test(src), 'ungated');
+  // R62: streaming is gated on the receipt naming OUR bucket, not merely on the
+  // binding existing -- a BYO receipt must not be looked up in it.
+  ok('streaming is gated on the internal bucket name',
+     /RESULTS_BUCKET_NAME/.test(src) &&
+     /isInternal\s*=/.test(src) &&
+     /bucket\.toLowerCase\(\)\s*===\s*internalBucket/.test(src),
+     'no internal-bucket gate');
+  ok('a BYO bucket is never streamed from the internal binding',
+     /!internalBucket \|\| bucket\.toLowerCase\(\) === internalBucket/.test(src),
+     'BYO receipts are not excluded');
   // Security-critical ordering: the payer must be proven BEFORE the bytes move.
   // Compare CALL sites, not textual position -- the helper's DEFINITION appears
   // earlier in the file than any call, which is not an ordering violation. Use
@@ -176,6 +186,26 @@ const getResult = async (env, query = '') => {
      /PAYMENT-SIGNATURE/.test(body.how_to_retrieve), body.how_to_retrieve);
   ok('meta mode does not stream the payload',
      !body.bucket || body.key === 'outputs/paid.parquet', body);
+}
+
+// --- 3b. R62: a BYO receipt must NOT be looked up in the internal binding ---
+// Regression: routing every receipt through env.RESULTS made BYO jobs 503,
+// because their object lives in the CALLER's bucket, not ours.
+{
+  const BYO_KEY = 'mine/file.parquet';
+  const BYO_BUCKET = 'caller-own-bucket';
+  putReceipt({ bucket: BYO_BUCKET, key: BYO_KEY });
+  const ref = encodeURIComponent(JSON.stringify({ key: BYO_KEY, bucket: BYO_BUCKET }));
+  const res = await gw.fetch(new Request(`https://gw.test/v1/compress/result?ref=${ref}`,
+    { headers: { 'PAYMENT-SIGNATURE': vec.header_b64url } }),
+    { ...baseEnv, RESULTS },                    // binding PRESENT, but wrong bucket
+    { waitUntil(p) { if (p && p.catch) p.catch(() => {}); } });
+  const body = await res.json();
+  console.log('BYO with R2 binding ->', res.status, JSON.stringify(body).slice(0, 130));
+  ok('a BYO receipt resolves even when the R2 binding exists', res.status === 200, res.status);
+  ok('it names the CALLER\'s bucket', body.bucket === BYO_BUCKET, body.bucket);
+  ok('it states the object is in the caller\'s own bucket',
+     typeof body.note === 'string' && /YOUR bucket/.test(body.note), body.note);
 }
 
 // --- 4. an unmatched payment gets NOTHING ---------------------------------
