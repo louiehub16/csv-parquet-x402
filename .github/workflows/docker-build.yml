@@ -25,6 +25,13 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install fastapi "uvicorn[standard]" pyarrow boto3 python-multipart pytest
+          # test_engine.py uses fastapi.testclient, which needs the httpx client.
+          # Starlette's error names `httpx2`, which IS a real package on PyPI --
+          # it is NOT a typo for httpx. Installing both covers either resolution
+          # path; without one of them collection fails with
+          # "starlette.testclient requires the httpx2 package" and CI exits 2
+          # having executed ZERO assertions.
+          pip install httpx httpx2
 
       # R61: the image must ship s3_guard.py alongside main.py, because main.py
       # imports it inside make_client. test_image_contents.py asserts exactly
