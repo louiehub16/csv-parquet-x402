@@ -36,6 +36,8 @@
   "vars": {
     // Public config only — secrets go via `wrangler secret put`:
     //   RUNPOD_API_KEY, RUNPOD_ENDPOINT_URL,
+    //   ENGINE_API_KEY (R74: gateway-only bearer the ENGINE enforces; anyone
+    //     with the RunPod URL would otherwise convert for free),
     //   R2_ENDPOINT_URL, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME,
     //   CDP_API_KEY_ID, CDP_API_KEY_SECRET (facilitator verify/settle;
     //   cdp.js reads CDP_API_KEY_SECRET)

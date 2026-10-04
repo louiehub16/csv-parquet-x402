@@ -978,7 +978,11 @@ export default {
           method: 'POST',
           body: outForm,
           signal: controller.signal,
-          headers: { Authorization: 'Bearer ' + env.RUNPOD_API_KEY },
+          // R74: the engine now REQUIRES a bearer token (R74 gateway-only auth),
+          // and compares it against ENGINE_API_KEY. RUNPOD_API_KEY was the
+          // platform credential; the engine reads ENGINE_API_KEY, so sending the
+          // wrong one would 401 every paid conversion.
+          headers: { Authorization: 'Bearer ' + (env.ENGINE_API_KEY || '') },
         });
         // R49: the engine RESPONDED, so compute is known to have run. Only now
         // is it unsafe to release the payer's authorization.

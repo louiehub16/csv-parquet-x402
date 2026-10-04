@@ -13,6 +13,7 @@ Rewrite of the vendor spec engine with the review-driven fixes applied:
   Diagnostics go to stdout only, with URLs and AKIA-style keys redacted.
 - NO use_byte_stream_split on the parquet writer (invalid for string columns)
 """
+import hmac
 import io
 import json
 import gc
@@ -26,7 +27,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.csv as pv
 import pyarrow.parquet as pq
-from fastapi import FastAPI, Form, UploadFile
+from fastapi import FastAPI, Form, Request, UploadFile
 from fastapi.responses import JSONResponse
 
 app = FastAPI(title="x402-parquet-engine")
@@ -426,8 +427,35 @@ def health():
 
 
 @app.post("/v1/compress")
-async def compress(file: UploadFile, target_destination: str = Form(None)):
+async def compress(file: UploadFile, target_destination: str = Form(None),
+                   request: Request = None):
     started = time.time()
+
+    # R74: GATEWAY-ONLY AUTH. The gateway already sends
+    #   Authorization: Bearer <RUNPOD_API_KEY>
+    # but the engine never checked it, so anyone who learned the RunPod URL
+    # could POST directly and get conversions -- and BYO writes into their own
+    # bucket -- without paying. The engine is only ever called by the paid
+    # gateway, so require that token and fail closed when it is unset.
+    _expected = os.getenv("ENGINE_API_KEY", "").strip()
+    if not _expected:
+        log_diagnostic("auth", "ENGINE_API_KEY is not set; refusing unauthenticated work")
+        return JSONResponse(status_code=503, content={
+            "status": "error",
+            "message": "Engine is not configured; refusing work."})
+    _got = ""
+    try:
+        if request is not None:
+            _auth = request.headers.get("Authorization") or ""
+            _got = _auth[7:].strip() if _auth[:7].lower() == "bearer " else ""
+    except Exception:
+        _got = ""
+    if not _got or not hmac.compare_digest(_got, _expected):
+        log_diagnostic("auth", "rejected request with a missing or invalid engine token")
+        return JSONResponse(status_code=401, content={
+            "status": "error",
+            "message": "Unauthorized."})
+
     try:
         # ---- resolve destination -----------------------------------------
         custom = None
