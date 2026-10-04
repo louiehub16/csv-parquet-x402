@@ -72,7 +72,17 @@ class FakeS3:
 FAKE = FakeS3()
 
 import boto3  # noqa: E402
+# R53: s3_guard.build_client() constructs its client via
+# boto3.session.Session().client(...) -- NOT boto3.client() -- so patching
+# boto3.client alone let the guard build a REAL client that dialled the
+# endpoint (405 from example.com). Patch the seam the guard actually uses,
+# and keep boto3.client patched for the legacy path.
 boto3.client = lambda *a, **k: FAKE
+try:
+    from boto3.session import Session as _BotoSession  # noqa: E402
+    _BotoSession.client = lambda self, *a, **k: FAKE
+except Exception:  # pragma: no cover - boto3 always exposes the session
+    pass
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import main as engine  # noqa: E402
@@ -80,14 +90,24 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 client = TestClient(engine.app)
 
+# R74: shared fake token the autouse fixture configures and _post() presents.
+ENGINE_TEST_KEY = "test-engine-token-not-a-real-secret"
+
 
 @pytest.fixture(autouse=True)
 def reset_fake(monkeypatch):
     FAKE.objects.clear()
     FAKE.multipart.clear()
     FAKE.fail_writes = False
+    # R74: /v1/compress now requires the gateway bearer token and FAILS CLOSED
+    # when ENGINE_API_KEY is unset, so the suite must supply one or every request
+    # is refused at the auth gate before reaching any asserted path.
+    monkeypatch.setenv("ENGINE_API_KEY", ENGINE_TEST_KEY)
     # Internal-storage env for the default path (boto3 is faked; values inert)
-    monkeypatch.setenv("R2_ENDPOINT_URL", "https://fake-r2.local")
+    # R53: s3_guard REQUIRES the endpoint host to resolve to public addresses,
+    # so a non-resolvable name is rejected before any S3 call. example.com is
+    # used because it resolves publicly; boto3 itself is faked below.
+    monkeypatch.setenv("R2_ENDPOINT_URL", "https://example.com")
     monkeypatch.setenv("R2_ACCESS_KEY_ID", "AKIAFAKEACCESS1234")
     monkeypatch.setenv("R2_SECRET_ACCESS_KEY", "fake-secret-key-000")
     monkeypatch.setenv("R2_BUCKET_NAME", "test-bucket")
@@ -112,7 +132,10 @@ def _post(csv_bytes, name="data.csv", dest=None):
     data = {}
     if dest is not None:
         data["target_destination"] = json.dumps(dest)
-    return client.post("/v1/compress", files=files, data=data)
+    # R74: the engine is gateway-only, so present the bearer token the fixture
+    # configured. Without it the request 503s at the auth gate.
+    return client.post("/v1/compress", files=files, data=data,
+                       headers={"Authorization": "Bearer " + ENGINE_TEST_KEY})
 
 
 def test_happy_path_10k_rows_internal():
