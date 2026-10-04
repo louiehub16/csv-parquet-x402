@@ -667,8 +667,11 @@ async def compress(file: UploadFile, target_destination: str = Form(None)):
                                 if col.type != field.type:
                                     try:
                                         col = pc.cast(col, field.type, safe=True)
-                                    except (pa.ArrowInvalid,
-                                            pa.ArrowNotImplementedError):
+                                    except (pa.ArrowInvalid, pa.ArrowTypeError,
+                                            pa.ArrowNotImplementedError) as cast_err:
+                                        # R72: any cast failure null-fills this column and records it
+                                        # as skipped -- one bad column must never kill a paid stream.
+                                        log_diagnostic("schema_cast", cast_err)
                                         col = pa.nulls(col.length(),
                                                        type=field.type)
                                         if field.name not in p_skipped:
