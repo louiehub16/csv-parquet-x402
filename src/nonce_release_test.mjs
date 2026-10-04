@@ -73,12 +73,18 @@ const js = (o, status) => new Response(JSON.stringify(o), { status });
 
 // --- AMBIGUOUS: the claim must be RETAINED (no flag) ---
 
-// 4. verify -> auth-layer failure (401): nothing proven either way.
+// 4. verify -> auth-layer failure (401).
+// R54 corrected this assertion. The failure is at the VERIFY stage, so /settle
+// was never called and nothing was submitted -- that IS provable certainty, and
+// claiming otherwise would let an unverified authorization look paid. The retry
+// flag still lets the client try again; it is the refund label that mattered.
 {
   const r = await call(js({ error: 'invalid token' }, 401),
                        js({ error: 'should not be reached' }, 500));
   console.log('verify 401       ->', JSON.stringify({ ok: r.ok, dns: r.definitelyNotSubmitted, retryable: r.retryable }));
-  ok('auth-layer failure does NOT claim certainty', r.definitelyNotSubmitted !== true, r);
+  ok('a verify-stage failure claims certainty (nothing was submitted)',
+     r.definitelyNotSubmitted === true, r);
+  ok('it stays retryable', r.retryable === true, r);
 }
 
 // 5. settle -> 5xx: ambiguous, must stay unknown.

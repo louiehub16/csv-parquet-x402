@@ -305,6 +305,46 @@ export class ConsumedTxStore {
         return this.json({ ok: true, newTotal: prior.totalAfter, idempotent: true }, 200);
       }
     }
+    // R78: a reconcile must REPLACE the estimate already booked for the same
+    // transaction, not ADD to it. The estimate was added at reservation time;
+    // adding the actual cost on top double-counts every completed job and
+    // exhausts the daily cap early. Find the sibling estimate key and apply the
+    // DELTA (actual - estimated).
+    if (kind === "reconcile" && body.transactionId) {
+      // The caller passes "<budgetTxId>:estimate" / "<budgetTxId>:reconcile" and
+      // this handler appends :kind, so the stored key is
+      // "<budgetTxId>:estimate:estimate". Strip our own suffix to find the base.
+      const baseTx = String(body.transactionId).replace(/:(estimate|reconcile)$/, "");
+      const estRec = await this.state.storage.get(`budget_tx:${baseTx}:estimate`);
+      if (estRec && typeof estRec === "object" && typeof estRec.amountUsd === "number") {
+        const estimated = Number(estRec.amountUsd);
+        const actual = Number(body.amountUsd);
+        // Read the CURRENT daily total, not estRec.totalAfter (a snapshot taken
+        // when the estimate was booked -- other jobs may have moved it since).
+        const now = await this.state.storage.get("budget:daily");
+        const currentTotal = (now && typeof now === "object" && typeof now.total === "number")
+          ? now.total : 0;
+        const isSameDay = !!(now && now.date === new Date().toISOString().slice(0, 10));
+        // delta <= 0 is the normal case (actual below estimate) and returns
+        // budget; a positive delta (actual above estimate) is still booked.
+        const delta = actual - estimated;
+        // A previous UTC date's residual is spent; only today's total is live.
+        const base = isSameDay ? currentTotal : 0;
+        const next = Math.max(0, base + delta);
+        if (delta !== 0) {
+          await this.state.storage.put("budget:daily", {
+            date: new Date().toISOString().slice(0, 10), total: next,
+          });
+        }
+        if (txKey) {
+          await this.state.storage.put(txKey, { amountUsd: actual, totalAfter: next });
+        }
+        if (delta === 0) {
+          return this.json({ ok: true, newTotal: base, reconciled: true, noop: true }, 200);
+        }
+        return this.json({ ok: true, newTotal: next, reconciled: true }, 200);
+      }
+    }
     const key = "budget:daily";
     const today = new Date().toISOString().slice(0, 10); // UTC date
     let rec = await this.state.storage.get(key);
