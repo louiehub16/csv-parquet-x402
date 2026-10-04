@@ -130,7 +130,11 @@ async function fetchR2Object(env, key) {
   if (!bucket || typeof bucket.get !== 'function') {
     throw new Error('RESULTS bucket binding unavailable');
   }
-  const object = bucket.get(key);
+  // R2Bucket.get() is ASYNCHRONOUS -- it returns a Promise<R2Object>. This was
+  // left unawaited, so `object` was a Promise: `object.body` was undefined and
+  // every paid internal download returned an EMPTY body (and meta=1 reported a
+  // null size). Await it.
+  const object = await bucket.get(key);
   if (!object) throw new Error('result object not found in bucket');
   return object;
 }

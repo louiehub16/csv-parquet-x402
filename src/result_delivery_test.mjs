@@ -31,7 +31,11 @@ const gets = [];
 // A faithful stand-in for the R2 Worker binding surface:
 //   env.BUCKET.get(key) -> R2Object with .body / .size / .arrayBuffer()
 const RESULTS = {
-  get(key) {
+  // R75: R2Bucket.get() returns a PROMISE (it is async in the Workers runtime).
+  // The mock used to be synchronous, which is exactly why the unawaited get()
+  // survived so many green runs: `object.body` on a real Promise is undefined
+  // and every paid download returns an EMPTY body. Model the real contract.
+  async get(key) {
     gets.push(key);
     const bytes = new TextEncoder().encode('PAR1-payload-bytes');
     return {
@@ -147,6 +151,13 @@ const getResult = async (env, query = '') => {
 
   ok('the payer gets 200', res.status === 200, res.status);
   ok('the object BYTES are returned, not coordinates', text.includes('PAR1-payload-bytes'), text);
+  // R75: an unawaited get() yields an EMPTY body. Assert real content, and that
+  // production awaits -- the async mock above is what makes this meaningful.
+  ok('the downloaded body is NOT empty', text.length > 0, 'empty body');
+  ok('the production fetchR2Object AWAITS bucket.get()',
+     /const object = await bucket\.get\(key\)/.test(
+       readFileSync(new URL('./index.js', import.meta.url), 'utf8')),
+     'bucket.get() is not awaited -- every paid download would be empty');
   ok('it is served as parquet', /parquet/.test(ctype), ctype);
   ok('it is an attachment with a sanitized filename',
      /attachment; filename="paid\.parquet"/.test(disp), disp);
