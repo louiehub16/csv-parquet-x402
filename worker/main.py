@@ -38,11 +38,18 @@ ALLOWED_INPUT_EXT = (".csv", ".tsv", ".txt")
 
 
 def mask_secret(s: str) -> str:
-    """Never log a full credential."""
-    s = str(s or "")
-    if len(s) < 12:
-        return "***"
-    return s[:4] + "..." + s[-4:]
+    """Never emit credential material, not even in part.
+
+    R73: this used to return `s[:4] + "..." + s[-4:]`, which publishes eight
+    characters of anything 12+ long. That is safe for an opaque id and
+    catastrophic for a secret, and redaction cannot be relied on to have removed
+    every secret first: measured on this tree, unlabeled credentials of 14/18/20/
+    23 characters all survived redaction and then leaked 8 characters here. Only
+    the exactly-40-character AWS shape was caught.
+    It is applied to LOG lines, so a fixed placeholder loses nothing that
+    redaction had not already preserved.
+    """
+    return "<redacted>"
 
 
 _URL_RE = re.compile(r"https?://\S+")
@@ -56,8 +63,13 @@ _CRED_ASSIGN_RE = re.compile(
     r"session_token|x_amz_security_token|bearer|authorization|api[_-]?key|"
     r"secret|token|password|passwd|credential)\b\s*[:=]\s*[\"']?([^\s,\"';]{4,})")
 _BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._\-]{8,}")
-# A bare 40-char secret (classic AWS secret key shape) with no label nearby.
-_BARE_SECRET_RE = re.compile(r"\b[A-Za-z0-9/+=]{40}\b")
+# A bare, unlabeled secret. R73: this was anchored with \b, which only matches
+# when the token starts AND ends on a word character -- so any secret containing
+# punctuation (p@ssw0rd, tok:abc) never matched at all, and leaked. It also only
+# matched an exactly-40-char token, so 14/18/20/23-char credentials leaked.
+# Match the token anywhere, from 12 chars up: below 12 the signal is too weak to
+# redact without shredding ordinary log text.
+_BARE_SECRET_RE = re.compile(r"[A-Za-z0-9/+=@\-_.:]{12,128}")
 
 
 # R34: The response for an internal failure must never carry exception text.

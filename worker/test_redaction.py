@@ -50,6 +50,14 @@ CASES = [
      "sk-live-abcdef123456", "generic api key"),
     ("x_amz_security_token: FwoGZXIvYXdzEAnotherExampleToken9876",
      "FwoGZXIvYXdzEAnotherExampleToken9876", "x-amz security token"),
+    # R73: unlabeled credentials of MANY lengths, not just the 40-char AWS shape.
+    # Before the fix only the 40-char case was caught; 14/18/20/23-char secrets
+    # survived redaction and then lost 8 characters through mask_secret().
+    ("AKIAIOSFODNN7EXAMPLEKEY", "AKIAIOSFODNN7EXAMPLEKEY", "unlabeled 23-char key"),
+    ("shortkey123456", "shortkey123456", "unlabeled 14-char secret"),
+    ("tok_abcdefghijklmnop", "tok_abcdefghijklmnop", "unlabeled 20-char token"),
+    ("p@ssw0rd-xyz-98765", "p@ssw0rd-xyz-98765", "unlabeled 18-char password"),
+    ("sk-1234567890abcdefXYZ", "sk-1234567890abcdefXYZ", "unlabeled 22-char sk token"),
     # R28: UNLABELED 40-char secret (classic AWS secret-key shape). This is what
     # _BARE_SECRET_RE was written for in R18 but never applied to.
     ("An error occurred (InvalidAccessKeyId): the request signature we calculated "
@@ -81,10 +89,18 @@ def main():
     # R28: the full response path is mask_secret(redact_message(err)). Verify the
     # COMBINED result leaks no part of a bare secret (mask_secret alone would
     # expose first4...last4).
-    combined_src = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
-    combined = mod.mask_secret(redact(combined_src))
-    if "wJalr" in combined or "YKEY" in combined or combined_src in combined:
-        failures.append(f"mask_secret(redact()) leaks secret fragments: {combined!r}")
+    # R73: mask_secret must never emit a PARTIAL secret -- first4/last4 was the
+    # leak. Check several lengths, and assert the output is a fixed placeholder.
+    for probe in ("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",   # 40
+                  "AKIAIOSFODNN7EXAMPLEKEY",                     # 23
+                  "tok_abcdefghijklmnop",                        # 20
+                  "shortkey123456"):                              # 14
+        combined = mod.mask_secret(redact("failed with %s" % probe))
+        if (probe in combined or probe[:4] in combined or probe[-4:] in combined):
+            failures.append("mask_secret(redact()) leaks fragments of a %d-char "
+                            "secret: %r" % (len(probe), combined))
+        if combined != "<redacted>":
+            failures.append("mask_secret is not a fixed placeholder: %r" % combined)
 
     for f in failures:
         print("FAIL:", f)
