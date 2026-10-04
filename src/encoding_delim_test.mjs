@@ -46,6 +46,8 @@ const ok = (label, cond, got) => { if (!cond) fails.push(`${label} — got ${JSO
   if (m) {
     const delims = m[1];
     ok('newline is a sniff candidate', /\\n/.test(delims), `DELIMS = (${delims})`);
+  ok('a newline-delimited .txt sniffs as the single-column sentinel',
+       /^NEWLINE_ONLY\s*=/m.test(py), 'NEWLINE_ONLY not defined');
     ok('carriage return is a sniff candidate', /\\r/.test(delims), `DELIMS = (${delims})`);
     ok('comma is still a candidate', /","/.test(delims), `DELIMS = (${delims})`);
     ok('tab is still a candidate', /\\t/.test(delims), `DELIMS = (${delims})`);
@@ -60,15 +62,19 @@ const ok = (label, cond, got) => { if (!cond) fails.push(`${label} — got ${JSO
   // backslash escape and produced a bogus SyntaxError.
   const py = readFileSync(join(HERE, '..', 'worker', 'main.py'), 'utf8');
   const s = py.indexOf('def choose_delimiter(');
-  const blank = py.indexOf('\n\n', s);
-  const fnSrc = py.slice(s, blank > 0 ? blank : s + 1500);
+  // Slice to the NEXT top-level definition: the body now contains blank lines,
+  // so cutting at the first blank line truncated it mid-function.
+  const nextDef = py.indexOf('\ndef ', s + 10);
+  const fnSrc = py.slice(s, nextDef > s ? nextDef : s + 2000);
   const delimsSrc = (py.match(/^DELIMS\s*=\s*\(.*?\)/m) || [''])[0];
+  const sentinelSrc = (py.match(/^NEWLINE_ONLY\s*=.*$/m) || [''])[0];
 
   const dir = mkdtempSync(join(tmpdir(), 'r64-'));
   const probe = join(dir, 'probe.py');
   writeFileSync(probe, [
     'import io',
     delimsSrc,
+    sentinelSrc,
     fnSrc,
     'def _run(sample, name):',
     '    return choose_delimiter(name, io.BytesIO(sample.encode("utf-8")))',
@@ -88,8 +94,8 @@ const ok = (label, cond, got) => { if (!cond) fails.push(`${label} — got ${JSO
   rmSync(dir, { recursive: true, force: true });
   console.log(out.trim());
   ok('the delimiter probe ran', code === 0, out.trim().slice(-200));
-  ok('a newline-delimited .txt sniffs as a newline (not corrupted)',
-     /NL=('\\n'|\\r')/.test(out), out.trim());
+  ok('a newline-delimited .txt sniffs as the single-column sentinel',
+     /NL='__newline_only__'/.test(out), out.trim());
   ok('a .csv still sniffs as comma', /CSV=','/.test(out), out.trim());
   ok('a .tsv still sniffs as tab', /TSV='\\t'/.test(out), out.trim());
 }

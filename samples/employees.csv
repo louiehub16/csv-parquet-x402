@@ -1,0 +1,16 @@
+id,name,email,signup_date,region,score,active,notes
+1,Ada Lovelace,ada@example.com,1843-01-01,EU,99.5,true,"analytical engine notes"
+2,Alan Turing,alan@example.com,1936-05-28,EU,98.2,true,pioneer
+3,Grace Hopper,grace@example.com,1906-12-09,US,97.8,true,compiler
+4,Katherine Johnson,katherine@example.com,1953-06-01,US,96.4,true,orbital mechanics
+5,Tim Berners-Lee,tim@example.com,1991-08-06,EU,95.1,true,www
+6,Barbara Liskov,barbara@example.com,1972-11-07,US,94.7,true,substitution
+7,Donald Knuth,donald@example.com,1963-01-01,US,93.9,true,tex
+8,Radia Perlman,radia@example.com,1988-06-01,US,92.3,true,spanning tree
+9,Vint Cerf,vint@example.com,1974-01-01,US,91.5,true,tcp-ip
+10,Shafi Goldwasser,shafi@example.com,1985-01-01,US,90.8,true,cryptography
+11,Leslie Lamport,leslie@example.com,1979-01-01,US,89.6,true,latex
+12,Margaret Hamilton, margaret@example.com,1965-03-01,US,88.2,true,"apollo, priority display"
+13,Frances Allen,frances@example.com,1966-01-01,US,87.4,true,optimizing compilers
+14,Evelyn Boyd Granville,evelyn@example.com,1962-01-01,US,86.1,true,"numerical analysis"
+15,Jean Bartik,jean@example.com,1946-01-01,US,85.0,true,eniac

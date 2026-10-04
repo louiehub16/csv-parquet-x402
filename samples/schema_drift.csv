@@ -1,0 +1,7 @@
+id,name,score,active
+1,Ada,99.5,true
+2,Alan,98.2,true
+3,Grace,not-a-number,true
+4,Katherine,96.4,true
+5,Tim,N/A,false
+6,Barbara,94.7,true,extra_col

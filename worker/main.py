@@ -187,16 +187,44 @@ def validate_endpoint_url(url: str) -> str:
 # comma/semicolon/tab still win when they are genuinely more frequent.
 DELIMS = (",", ";", "\t", "\n", "\r")
 
+# R71: sentinel for newline-delimited (single-column) input. pyarrow
+# rejects a newline delimiter outright, so this value must never be
+# handed to ParseOptions as a delimiter.
+NEWLINE_ONLY = "__newline_only__"
+
 
 def choose_delimiter(filename: str, fobj) -> str:
     """Derive the input delimiter from the filename extension:
     .tsv -> tab, .csv -> comma, .txt -> sniff the first 64KB and take the
     most frequent candidate of comma/semicolon/tab (ties break to comma)."""
     low = str(filename or "").lower()
-    if low.endswith(".tsv"):
-        return "\t"
-    if low.endswith(".csv"):
-        return ","
+    # R70: the extension is a HINT, not a verdict. A .csv delimited with
+    # semicolons is common (European exports) and short-circuiting to comma
+    # parsed it as one giant column, silently corrupting every row.
+    hinted = ("\t" if low.endswith(".tsv") else
+              ("," if low.endswith(".csv") else None))
+    sample = fobj.read(65536)
+    fobj.seek(0)
+    counts = {d: sample.count(d.encode()) for d in DELIMS}
+
+    # R71: when ONLY line breaks separate the data (no comma, semicolon or
+    # tab anywhere), this is a newline-delimited text file -- a
+    # SINGLE-COLUMN file. pyarrow rejects a newline delimiter outright, so
+    # signal it with a sentinel that never reaches ParseOptions.
+    if (max(counts.get(d, 0) for d in (",",";","\t")) == 0
+            and max(counts.get("\n", 0),
+                     counts.get("\r", 0)) > 0):
+        return NEWLINE_ONLY
+
+    best = max(counts.values())
+    if best <= 0:
+        return hinted or ","
+    if hinted is not None and counts.get(hinted, 0) == best:
+        return hinted
+    for d in DELIMS:  # tuple order => comma wins ties
+        if counts[d] == best:
+            return d
+    return hinted or ","
     sample = fobj.read(65536)
     fobj.seek(0)
     counts = {d: sample.count(d.encode()) for d in DELIMS}
@@ -603,7 +631,10 @@ async def compress(file: UploadFile, target_destination: str = Form(None)):
                         use_threads=True),
                     parse_options=pv.ParseOptions(
                         newlines_in_values=False,
-                        delimiter=chosen_delimiter,
+                        # R71: a newline-delimited file is a SINGLE-COLUMN file;
+                        # pyarrow rejects a newline delimiter, so map the sentinel to None.
+                        delimiter=(None if chosen_delimiter == NEWLINE_ONLY
+                                   else chosen_delimiter),
                         invalid_row_handler=skip_invalid_row),
                     convert_options=convert_options,
                 )

@@ -1,0 +1,7 @@
+order_id customer item qty unit_price
+1001 Ada Lovelace Widget A 3 19.99
+1002 Alan Turing Widget B 1 24.50
+1003 Grace Hopper Gadget C 2 149.00
+1004 Katherine Johnson Gadget D 5 8.75
+1005 Tim Berners-Lee Doohickey E 1 199.99
+1006 Barbara Liskov Thingamajig F 4 55.25

@@ -1,0 +1,7 @@
+id;product;price;currency;in_stock;updated
+1;Widget A;19.99;USD;true;2024-01-15
+2;Widget B;24.50;USD;false;2024-02-20
+3;Gadget C;149.00;EUR;true;2024-03-05
+4;Gadget D;8.75;GBP;true;2024-03-22
+5;Doohickey E;199.99;USD;false;2024-04-01
+6;Thingamajig F;55.25;USD;true;2024-04-18
