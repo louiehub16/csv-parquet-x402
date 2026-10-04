@@ -26,6 +26,7 @@
 
 import { sha256, signDigest } from './_secp256k1.js';
 import { keccak256 } from './x402.js';
+import { safeDiag } from './x402.js';
 
 const CDP_BASE = 'https://api.cdp.coinbase.com/platform/v2/x402';
 // CDP's API-key JWT expects the `uri` claim to include the HOST, e.g.
@@ -305,7 +306,7 @@ export async function cdpVerifyAndSettle(env, paymentHeaderB64, resourceName, mi
   try {
     expected = BigInt(String(expectedAmountUsdc));
   } catch (e) {
-    console.error('[cdp] invalid expectedAmountUsdc config:', String(expectedAmountUsdc));
+    console.error('[cdp] invalid expectedAmountUsdc config (value redacted)');
     return { mode: 'cdp', ok: false, retryable: true, reason: 'expected_amount_config_invalid' };
   }
   if (expected < 0n) {
@@ -323,7 +324,7 @@ export async function cdpVerifyAndSettle(env, paymentHeaderB64, resourceName, mi
     try {
       required = BigInt(String(minMicroUsdc));
     } catch (e) {
-      console.error('[cdp] invalid minMicroUsdc config:', String(minMicroUsdc));
+      console.error('[cdp] invalid minMicroUsdc config (value redacted)');
       return { mode: 'cdp', ok: false, retryable: true, reason: 'min_amount_config_invalid' };
     }
     if (required < 0n) return { mode: 'cdp', ok: false, retryable: true, reason: 'min_amount_config_invalid' };
@@ -492,11 +493,11 @@ export async function cdpVerifyAndSettle(env, paymentHeaderB64, resourceName, mi
     // moved -- reporting settledUnknown here would fabricate a refund. Only a
     // post-submit failure is genuinely ambiguous.
     if (!settleSubmitted) {
-      console.error('[cdp] pre-settle failure, nothing submitted:', (e && e.message) || e);
+      safeDiag('cdp.pre_settle', e);
       return { mode: 'cdp', ok: false, retryable: true, stage,
         definitelyNotSubmitted: true, reason: 'pre_settle_failure' };
     }
-    console.error('[cdp] settlement outcome ambiguous:', (e && e.message) || e);
+    safeDiag('cdp.settle_ambiguous', e);
     return { mode: 'cdp', ok: false, retryable: false, reason: 'settlement_ambiguous',
       stage, settledUnknown: true };
   }

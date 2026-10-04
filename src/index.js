@@ -15,6 +15,7 @@ import { recoverAuthorizationSigner } from './authz_sign.js';
 import * as spendguard from './spendguard.js';
 import { reserveDailyBudget, getDailyBudget, reconcileDailyBudget } from './budget.js';
 import { ConsumedTxStore } from './replay-store.js';
+import { safeDiag } from './x402.js';
 
 // Durable Object class must be exported from the worker entry point so the
 // CONSUMED_TX_STORE binding resolves to this script at deploy time.
@@ -302,7 +303,7 @@ export default {
                 'S3 credentials you supplied; the gateway does not hold them.',
         });
       } catch (e) {
-        console.error('[result] retrieval failed:', (e && e.message) || e);
+        safeDiag('result.retrieval_failed', e);
         return json({ error: 'result_unavailable' }, 503);
       }
     }
@@ -776,7 +777,7 @@ export default {
           const claimNonce = (info && info.nonce) || v0Nonce;
           try { await consumeNonce(env, claimNonce); }
           catch (e) {
-            console.error('[gateway] nonce claim rejected before settlement:', (e && e.message) || e);
+            safeDiag('gateway.nonce_claim_rejected', e);
             return { ok: false, reason: 'nonce_consumption_failed', terminal: false };
           }
           settleAttempted = true;
@@ -1361,7 +1362,7 @@ export default {
             body: JSON.stringify({ nonce: v.nonce }) });
         }
       } catch (_) {}
-      console.error('[gateway] internal_error:', (e && e.stack) || e);
+      safeDiag('gateway.internal_error', e);
       // R26: recordRefund() returning true means the refund was EXECUTED and
       // durably recorded, so the honest label is 'completed'. Reporting
       // 'queued' re-introduced a promise the operator sweep may never fulfil.

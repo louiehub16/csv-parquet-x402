@@ -117,6 +117,47 @@ const bytesToHex = (b) => [...b].map((x) => x.toString(16).padStart(2, '0')).joi
 // public/.well-known/x402.json exactly.
 // Per-GB tiers charge byte-proportionally, rounded UP to the next micro-USDC
 // unit, each with a min charge floor of 10000 micro-USDC ($0.01).
+// R76: REDACTING DIAGNOSTIC LOGGER. console.error('[x] internal_error:', e.stack)
+// publishes raw exception text -- URLs, query strings, Authorization headers,
+// S3 keys, and credential material from upstream failures all reach the log
+// verbatim. Every diagnostic goes through here instead: the operator keeps the
+// failure class and a correlation id, never the payload.
+const _SECRET_PATTERNS = [
+  /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g,                    // AWS access key ids
+  /\b[A-Za-z0-9/+=]{40}\b/g,               // bare 40-char secrets
+  // NOTE: JavaScript regexes do NOT support an inline (?i) flag -- use /gi.
+  /\b(?:bearer|authorization)\b[\s:=]+[A-Za-z0-9._\-]{8,}/gi,
+  /\b(?:secret|password|passwd|token|api[_-]?key)\b[\s:=]+[^\s,;"']{4,}/gi,
+  /https?:\/\/[^\s"'<>]+/g,                               // URLs (may carry sig=)
+  /\b(?:Signature|X-Amz-Security-Token|x-amz-signature)=[^\s&"']*/gi,
+];
+
+// Stable, non-reversible id so a log line can be correlated with a request
+// without recording anything sensitive about it.
+let _diagCounter = 0;
+function diagId() {
+  _diagCounter = (_diagCounter + 1) >>> 0;
+  return _diagCounter.toString(36).padStart(6, '0');
+}
+
+export function safeDiag(scope, err, extra) {
+  let cls = 'unknown';
+  try {
+    const e = err instanceof Error ? err : (err && err.name ? { name: err.name } : null);
+    if (e && typeof e.name === 'string') cls = e.name.slice(0, 40);
+  } catch (_) { /* never let logging throw */ }
+  const id = diagId();
+  let msg = '';
+  try {
+    msg = String((err && (err.message || err)) || '');
+    for (const re of _SECRET_PATTERNS) msg = msg.replace(re, '<redacted>');
+    if (msg.length > 120) msg = msg.slice(0, 120) + '…';
+  } catch (_) { msg = '<unprintable>'; }
+  console.error('[%s] diag=%s class=%s detail=%s', scope, id, cls, msg || '<none>',
+    ...(extra === undefined ? [] : [extra]));
+  return id;
+}
+
 export function tierForBytes(sizeBytes) {
   const b = Number(sizeBytes);
   if (!Number.isFinite(b) || b < 0) throw new RangeError('size must be a non-negative number');
