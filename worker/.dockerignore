@@ -1,0 +1,16 @@
+# Keep the build context minimal and deterministic. R61 proved that main.py
+# imports s3_guard.py at runtime, so BOTH must ship; everything else is noise.
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.pytest_cache
+.cache/
+tests/
+test_*.py
+# Never bake credentials or local secrets into a published image.
+.env
+.dev.vars
+*.pem
+*wallet*.json
+x402_wallet_project.json
