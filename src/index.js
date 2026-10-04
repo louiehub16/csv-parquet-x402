@@ -728,15 +728,13 @@ export default {
         if (!pb.ok) return json({ error: 'upstream_balance_unavailable', note: pb.note }, pb.status);
       }
 
-      // (7.95) ATOMIC BUDGET RESERVATION (SpendGuard DO) — before settlement;
-      //     a rejected job must never have charged the payer. Fully released
-      //     again by the catch-all (nothing is dispatched at this point).
+      // (7.95) BUDGET RESERVATION — MOVED INTO settle() (R80).
+      // It used to mutate the durable counter HERE, BEFORE verifyPayment() proved
+      // the signature: any unauthenticated caller with a valid multipart request
+      // could exhaust the daily cap and make genuine paid jobs fail. The
+      // reservation now happens inside settle(), which runs only AFTER the
+      // authorization is verified and immediately BEFORE the facilitator call.
       budgetTxId = 'conv-' + crypto.randomUUID(); // assign the hoisted binding
-      {
-        const res = await reserveDailyBudget(env, est, budgetTxId);
-        if (!res.ok)
-          return json({ error: 'daily_budget_exhausted', note: res.note }, res.status || 503);
-      }
 
       // (8) PAYMENT VERIFY — challenge carries the EXACT tier price; the
       //     signed authorization must commit to exactly that amount.
@@ -761,6 +759,19 @@ export default {
         // R54: settlement is PART of verification — ok:true only after a
         // confirmed transfer AND a consumed nonce.
         settle: async (_payment, info) => {
+          // R80: ATOMIC BUDGET RESERVATION, now inside settle() so it runs only
+          // after the signature/window/price were proven. A rejected job must
+          // never charge the payer, and an UNAUTHENTICATED caller must never be
+          // able to move the durable counter. Both hold here: settle() is only
+          // reached after verifyPayment() validated the authorization.
+          {
+            const res = await reserveDailyBudget(env, est, budgetTxId);
+            if (!res.ok) {
+              // Nothing was settled and nothing will be dispatched.
+              return { ok: false, reason: 'daily_budget_exhausted',
+                       definitelyNotSubmitted: true, retryable: true };
+            }
+          }
           // R39: we bail BEFORE contacting the facilitator, so nothing was
           // submitted. Say so explicitly, or the nonce claim taken by
           // verifyPayment stays consumed and this authorization can never be
