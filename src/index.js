@@ -957,11 +957,25 @@ export default {
       if (dest && dest.endpoint_url) outForm.append('target_destination', JSON.stringify(dest));
 
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(),
-        tier.requiresUserDest ? 45 * 60 * 1000 : 10 * 60 * 1000);
-      const onAbort = () => controller.abort();
+      // R79: the abort budget is env-overridable so a TEST can compress the
+      // timeout instead of tripping the client signal (which is a disconnect).
+      const _tmo = Number(env.UPSTREAM_TIMEOUT_MS);
+      const timeoutMs = (Number.isFinite(_tmo) && _tmo > 0)
+        ? _tmo
+        : (tier.requiresUserDest ? 45 * 60 * 1000 : 10 * 60 * 1000);
+      const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+      // R79: distinguish OUR timeout from a CLIENT DISCONNECT. Both abort the same
+      // controller, but they mean different things: a timeout may leave compute
+      // billing (no auto-refund), whereas a client that hung up before the engine
+      // ever accepted the job produced nothing at all and must be compensated
+      // through the normal durable refund path.
+      let abortedByClient = false;
+      const onAbort = () => {
+        abortedByClient = true;
+        controller.abort();
+      };
       if (request.signal) {
-        if (request.signal.aborted) controller.abort();
+        if (request.signal.aborted) { abortedByClient = true; controller.abort(); }
         else request.signal.addEventListener('abort', onAbort, { once: true });
       }
 
@@ -998,6 +1012,50 @@ export default {
               // Distinguish our timeout abort (504 Gateway Timeout, as documented)
               // from genuine upstream unreachability (502).
               if (e && e.name === 'AbortError') {
+                // R79: a CLIENT DISCONNECT is not a timeout. If the engine never
+                // accepted the job, no compute ran and no output exists, so this
+                // must take the ordinary durable refund path -- otherwise a
+                // settled payer is charged for undelivered work and the operator
+                // sweep is asked to reconcile something that never started.
+                if (abortedByClient && !upstreamAccepted) {
+                  const reason = 'client_disconnected_before_dispatch';
+                  let refunded = false;
+                  if (paymentSettled) {
+                    try { refunded = await recordRefund(reason); }
+                    catch (_) { refunded = false; }
+                  }
+                  if (v && v.nonce) {
+                    ctx.waitUntil(env.SECURITY_KV.put('abort:' + v.nonce,
+                      JSON.stringify({
+                        nonce: v.nonce, payer: v.payer || null,
+                        amountUsdc: tier.microUsdc, reason,
+                        settled: true, refunded,
+                        budgetTxId: budgetTxId || null,
+                        at: Date.now(), status: refunded ? 'refunded' : 'refund_required',
+                      }), { expirationTtl: 604800 }).catch(() => {}));
+                  }
+                  safeDiag('gateway.client_disconnect', e);
+                  if (paymentSettled) {
+                    return json({ error: 'client_disconnected',
+                      refund: refunded ? 'completed' : 'required',
+                      note: 'the connection closed before the conversion ran' }, 499);
+                  }
+                  // Not collected: release the claim so the authorization is
+                  // retryable rather than burned.
+                  if (env.CONSUMED_TX_STORE && v && v.nonce) {
+                    ctx.waitUntil((async () => {
+                      try {
+                        const idc = env.CONSUMED_TX_STORE.idFromName('singleton');
+                        await env.CONSUMED_TX_STORE.get(idc).fetch(
+                          'https://internal/release-nonce', {
+                            method: 'POST', headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ nonce: v.nonce }) });
+                      } catch (_) {}
+                    })());
+                  }
+                  return json({ error: 'client_disconnected',
+                    refund: 'not_applicable' }, 499);
+                }
                 // OX-ALPHA: an abort/timeout does NOT guarantee RunPod stopped the
                 // job — compute may still be billing. Leave the reservation STANDING
                 // (conservative) and release it via a subsequent reconciliation if

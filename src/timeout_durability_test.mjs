@@ -11,10 +11,15 @@
 import { readFileSync } from 'node:fs';
 import gw from './index.js';
 
-const vec = JSON.parse(readFileSync('./e2e_vector.json', 'utf-8'));
+// Read the vector LAZILY: mint_vector.py refreshes the authorization time
+// window, and an import-time read captured a stale/expired vector (which
+// failed as time_window_violation and looked like a gateway bug).
+let vec = null;
+const getVec = () => (vec = JSON.parse(readFileSync('./e2e_vector.json', 'utf-8')));
 const kv = new Map();
 const env = {
   MERCHANT_WALLET_ADDRESS: '0x795dCA28d0e8a0E5d19D689163f125a7da1D0B83',
+  UPSTREAM_TIMEOUT_MS: '25',   // compress OUR gateway timeout (R79)
   CDP_API_KEY_ID: 'k', CDP_API_KEY_SECRET: '4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318',
   RUNPOD_ENDPOINT_URL: 'https://fake.upstream', RUNPOD_API_KEY: 'k',
   SECURITY_KV: { get: async (k) => (kv.has(k) ? kv.get(k) : null), put: async (k, v) => kv.set(k, v) },
@@ -66,7 +71,9 @@ globalThis.fetch = async (url, opts) => {
   // Real dispatch reached: trip the request abort so the gateway's AbortController
   // fires exactly as its own 10-minute timer eventually would.
   if (u0.includes('fake.upstream')) {
-    setTimeout(() => abortNow(), 10);
+    // No abort here: the gateway's OWN timer fires (UPSTREAM_TIMEOUT_MS is set
+    // to a few ms below). This is the only way to exercise the real timeout path
+    // now that a client-signal abort is correctly treated as a disconnect.
   }
   // Upstream accepts the job then stalls. Behave like a real fetch: honour the
   // AbortSignal, so the gateway's own AbortController drives the timeout path.
@@ -84,20 +91,23 @@ try {
   const fd = new FormData();
   fd.append('file', new File([new TextEncoder().encode('a,b\n1,2\n')], 'tiny.csv'));
   const req = new Request('https://gw.test/v1/compress', { method: 'POST', body: fd,
-    headers: { 'PAYMENT-SIGNATURE': vec.header_b64url } });
-  // The gateway's own 10-minute timer is compressed: the upstream stub trips
-  // the request's AbortController, which is the identical code path.
-  const ac = new AbortController();
-  abortNow = () => ac.abort();
+    headers: { 'PAYMENT-SIGNATURE': getVec().header_b64url } });
+  // R79: NO request signal is supplied. A client-supplied signal that aborts is a
+  // CLIENT DISCONNECT and now (correctly) takes the refund path; to exercise OUR
+  // controller timeout, the only abort source must be the gateway's own -- which
+  // the upstream stub trips below, exactly as its setTimeout would.
   const r = await Promise.race([
-    gw.fetch(new Request(req, { signal: ac.signal }), env,
+    gw.fetch(req, env,   // no client signal: the gateway's controller is the only abort source
       { waitUntil(p) { if (p && p.catch) p.catch(() => {}); } }),
     new Promise((res) => setTimeout(() => res(null), 8000)),
   ]);
   if (!r) { console.log('FAIL: gateway never settled after the upstream timeout'); process.exit(1); }
   const body = await r.json();
   console.log('timeout status:', r.status, '| body:', JSON.stringify(body).slice(0, 160));
-  if (r.status !== 504) fails.push(`expected 504 gateway_timeout, got ${r.status}`);
+  if (r.status !== 504) {
+    fails.push(`expected 504 gateway_timeout, got ${r.status}` +
+      ` [note=${JSON.stringify(body.note)} statusNote=${JSON.stringify(body.statusNote)}]`);
+  }
   if (body.error !== 'gateway_timeout') fails.push(`error should be gateway_timeout, got ${body.error}`);
   if (body.refund === 'not_applicable' && body.settled_collected !== false) {
     fails.push('reported not_applicable while a payment had been collected');
