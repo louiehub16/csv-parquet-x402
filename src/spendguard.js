@@ -62,7 +62,7 @@ export async function sanitizeHeaders(request) {
 // put() lands, so a tight burst may slightly exceed RATE_MAX_HITS per window. Impact is bounded
 // (each write still prunes to the sliding window and re-caps subsequent hits) and fail-closed on
 // KV errors remains unchanged.
-export async function rateLimit(env, ip) {
+export async function rateLimit(env, ip, opts = {}) {
   // R12.1 F6: FAIL CLOSED on missing/failing KV — an unverifiable rate state is a 503, never a pass.
   if (!env || !env.SECURITY_KV) return { ok: false, status: 503, note: "kv_missing" };
   let hits = [];
@@ -85,10 +85,17 @@ export async function rateLimit(env, ip) {
       }
     }
     hits = hits.filter((t) => t <= now && now - t < RATE_WINDOW_MS);
+    // R81: READ-ONLY by default. The mutating count is opt-in (`count: true`),
+    // so an UNAUTHENTICATED caller cannot fill a shared per-IP window and lock
+    // out legitimate clients behind that address for free.
+    if (!opts.count) {
+      if (hits.length >= RATE_MAX_HITS) return { ok: false, status: 429 };
+      return { ok: true, hits: hits.length, limited: false };
+    }
     if (hits.length >= RATE_MAX_HITS) return { ok: false, status: 429 };
     hits.push(now);
     await env.SECURITY_KV.put(key, JSON.stringify(hits), { expirationTtl: RATE_KV_TTL });
-    return { ok: true };
+    return { ok: true, hits: hits.length, limited: true };
   } catch (e) {
     return { ok: false, status: 503, note: "rate_state_unavailable" }; // FAIL CLOSED
   }

@@ -365,6 +365,8 @@ export default {
         }));
         if (!sh.ok) return json({ error: 'header_sanity_failed' }, sh.status);
         const ip = request.headers.get('cf-connecting-ip') || 'unknown';
+        // R81: READ-ONLY. An unauthenticated caller must not be able to count
+        // against (and fill) a shared per-IP window.
         const rl = await spendguard.rateLimit(env, ip);
         if (!rl.ok) return json(rl.note ? { error: 'rate_limited', note: rl.note } : { error: 'rate_limited' }, rl.status);
       }
@@ -769,6 +771,17 @@ export default {
             if (!res.ok) {
               // Nothing was settled and nothing will be dispatched.
               return { ok: false, reason: 'daily_budget_exhausted',
+                       definitelyNotSubmitted: true, retryable: true };
+            }
+          }
+          // R81: MUTATING rate-limit count, now that the authorization is proven.
+          // The pre-verification check is read-only; counting happens exactly
+          // once per AUTHENTICATED, PAID attempt.
+          {
+            const ip2 = request.headers.get('cf-connecting-ip') || 'unknown';
+            const rl2 = await spendguard.rateLimit(env, ip2, { count: true });
+            if (!rl2.ok) {
+              return { ok: false, reason: 'rate_limited',
                        definitelyNotSubmitted: true, retryable: true };
             }
           }

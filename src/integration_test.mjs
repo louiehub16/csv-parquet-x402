@@ -101,16 +101,21 @@ globalThis.fetch = async (url, opts) => {  const u0 = String(url);
     // (topic0 0x98de5035..., confirmed against live Base mainnet USDC logs).
     // The confirm step requires that event PLUS a matching-value Transfer, so
     // the fixture emits both. A bare Transfer is (correctly) not sufficient.
+    // R82: the authorizer/Transfer topics must carry the CURRENT vector's payer.
+    // e2e_vector.json is re-minted (fresh throwaway key) before each run, so a
+    // hardcoded payer made the on-chain proof fail to bind -> 502
+    // settlement_unconfirmed even though the production code was correct.
+    const payerTopic = '0x' + String(vec.payer_expected).toLowerCase().replace(/^0x/, '');
     return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: {
       status: '0x1',
       logs: [      { address: '0x833589FCD6eDb6E08f4c7C32D4f71b54bdA02913',
         topics: ['0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef',
-          '0x' + '0'*24 + '19e7e376e7c213b7e7e7e46cc70a5dd086daff2a',
+          payerTopic,
           '0x795dca28d0e8a0e5d19d689163f125a7da1d0b83'],
         data: '0x' + (10000).toString(16).padStart(64, '0') }
       , { address: '0x833589FCD6eDb6E08f4c7C32D4f71b54bdA02913',
         topics: ['0x98de503528ee59b575ef0c0a2576a82497bfc029a5685b209e9ec333479b10a5',
-          '0x' + '0'*24 + '19e7e376e7c213b7e7e7e46cc70a5dd086daff2a',
+          payerTopic,
           '0x' + String(lastAuthNonce).replace(/^0x/, ''),
           '0x' + (10000).toString(16).padStart(64, '0')] }]
     } }), { status: 200 });

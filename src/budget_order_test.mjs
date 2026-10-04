@@ -29,7 +29,31 @@ ok('the reservation is inside settle(), not before it',
    `reserve@${reserveAt} must be after settle@${settleAt}`);
 
 // --- 2. it must precede the facilitator call inside the same callback -------
-const settleBlock = src.slice(settleAt, settleAt + 2600);
+// R82: this used to slice a HARD-CODED 2600 characters from the `settle:`
+// anchor and look for cdpVerifyAndSettle inside that window. R81 inserted 11
+// lines into the callback, pushing the facilitator call past 2600, so the
+// lookup returned -1 and the suite reported a failure for CORRECT production
+// code (reserve@471 settle@-1). A fixed character window is not a contract:
+// it breaks on any unrelated edit inside the callback. Match the CALLBACK
+// BOUNDARIES by brace balance instead, so the assertion survives any insertion.
+function blockAt(text, start) {
+  const open = text.indexOf('{', start);
+  if (open < 0) return '';
+  let depth = 0;
+  for (let i = open; i < text.length; i++) {
+    const c = text[i];
+    if (c === '{') depth++;
+    else if (c === '}') {
+      depth--;
+      if (depth === 0) return text.slice(start, i + 1);
+    }
+  }
+  return text.slice(start);
+}
+const settleBlock = blockAt(src, settleAt);
+ok('the settle callback body was located by brace balance',
+   settleBlock.length > 200 && /^\s*settle: async/.test(settleBlock),
+   `block length ${settleBlock.length}`);
 const facilitatorAt = settleBlock.indexOf('cdpVerifyAndSettle');
 ok('the reservation precedes the facilitator call',
    facilitatorAt > 0 && reserveAt - settleAt < facilitatorAt,

@@ -1,7 +1,17 @@
 # Review Ledger — csv-parquet-x402
 
-**Status: dual PASS at round 76** (commit `75666a3`), 39/39 suites green, ad-hoc
-verification PASS.
+**Status: dual PASS at round 83** (uncommitted working tree on top of commit
+`b0d8ba4`), **42/42 suites green**, `source_drift: []` on the passing round.
+
+Evidence: `review/r83/verdict_bunnyA_security.json` and
+`review/r83/verdict_bunnyB_code.json` are both `{"verdict":"PASS","reasons":[]}`,
+both with `finish_reason: stop` (real verdicts, not transport drops), and
+`python review/make_manifest.py review/r83 --check` reports `source_drift: []`.
+Reproduce with `python _gate.py`.
+
+**Known standing caveat, unchanged:** 6 of the earlier 59 rounds were genuine dual
+passes and **five of those six were followed by further defects.** A single dual pass
+is *not* evidence of convergence — the most important fact in this ledger.
 
 This file replaces the previous ledger, which stopped at round R23 and was
 materially wrong: it claimed *"Settlement not wired — delivered conversions are

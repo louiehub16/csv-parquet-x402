@@ -55,15 +55,19 @@ globalThis.fetch = async (url, opts) => {
       payer: auth.from, amount: String(auth.value), nonce: auth.nonce, payTo: auth.to }), { status: 200 });
   }
   if (u0.includes('mainnet.base.org') || u0.includes('eth_getTransactionReceipt')) {
+    // R82: topics must carry the CURRENT vector's payer. The vector is re-minted
+    // with a fresh throwaway key before each run, so a hardcoded payer stopped
+    // the on-chain proof from binding -> 502 instead of the expected 504.
+    const payerTopic = '0x' + String(vec.payer_expected).toLowerCase().replace(/^0x/, '');
     return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: { status: '0x1', logs: [
       { address: '0x833589FCD6eDb6E08f4c7C32D4f71b54bdA02913',
         topics: ['0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef',
-          '0x' + '0'*24 + '19e7e376e7c213b7e7e7e46cc70a5dd086daff2a',
+          payerTopic,
           '0x795dca28d0e8a0e5d19d689163f125a7da1d0b83'],
         data: '0x' + (10000).toString(16).padStart(64, '0') },
       { address: '0x833589FCD6eDb6E08f4c7C32D4f71b54bdA02913',
         topics: ['0x98de503528ee59b575ef0c0a2576a82497bfc029a5685b209e9ec333479b10a5',
-          '0x' + '0'*24 + '19e7e376e7c213b7e7e7e46cc70a5dd086daff2a',
+          payerTopic,
           '0x' + String(lastAuthNonce).replace(/^0x/, '')] },
     ] } }), { status: 200 });
   }
